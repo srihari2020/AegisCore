@@ -1,4 +1,6 @@
+import base64
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -7,7 +9,7 @@ class WSLWindowsInterop:
         self._apps_map: dict[str, str] = {}
 
     def _scan_uwp_start_apps(self) -> dict[str, str]:
-        """Queries Windows Get-StartApps to index Microsoft Store / MSIX / UWP apps (e.g., WhatsApp)."""
+        """Queries Windows Get-StartApps to index Microsoft Store / MSIX / UWP apps."""
         uwp_apps: dict[str, str] = {}
         try:
             ps_cmd = (
@@ -112,46 +114,140 @@ class WSLWindowsInterop:
         )
         return f"LAUNCHED_VIA_WSL_INTEROP: {win_path}"
 
-    def in_app_search(self, app_name: str, search_query: str, open_first: bool = True) -> str:
-        """Brings app to foreground (launching if needed), runs Ctrl+F, pastes query, and opens top match."""
-        safe_title = app_name.strip().replace("'", "''")
-        safe_query = search_query.strip().replace("'", "''")
-        select_keys = "{DOWN}{ENTER}" if open_first else ""
+    @staticmethod
+    def _clean_contact_query(raw_query: str) -> str:
+        # Strip trailing relationship descriptors like "friend", "bro", "contact"
+        cleaned = re.sub(r"\b(my\s+)?(friend|bro|bhai|contact|chat|message)\b", "", raw_query, flags=re.IGNORECASE)
+        return " ".join(cleaned.split()).strip() or raw_query.strip()
 
-        # Ensure app is launched/brought forward first
+    def in_app_search(self, app_name: str, search_query: str, open_first: bool = True) -> str:
+        """Forces Windows foreground focus, searches inside app via UIA + Ctrl+F, and clicks the matching chat/item."""
+        clean_query = self._clean_contact_query(search_query)
         self.launch(app_name)
 
         ps_script = f"""
 Add-Type -AssemblyName System.Windows.Forms
-$wshell = New-Object -ComObject WScript.Shell
-$activated = $false
-for ($i = 0; $i -lt 10; $i++) {{
-    $proc = Get-Process | Where-Object {{ $_.MainWindowTitle -like '*{safe_title}*' -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-    if ($proc -and $wshell.AppActivate($proc.Id)) {{
-        $activated = $true
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+$win32Code = @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Focus {{
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+    public static void ForceForeground(IntPtr hWnd) {{
+        keybd_event(0x12, 0, 0, UIntPtr.Zero); // Alt down (unlocks Windows foreground lock)
+        ShowWindow(hWnd, 9); // SW_RESTORE
+        BringWindowToTop(hWnd);
+        SetForegroundWindow(hWnd);
+        keybd_event(0x12, 0, 2, UIntPtr.Zero); // Alt up
+    }}
+
+    public static void ClickAt(int x, int y) {{
+        SetCursorPos(x, y);
+        System.Threading.Thread.Sleep(60);
+        mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); // LEFTDOWN
+        mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); // LEFTUP
+    }}
+}}
+"@
+Add-Type -TypeDefinition $win32Code
+
+$appTitle = {json.dumps(app_name.strip())}
+$query = {json.dumps(clean_query)}
+$openFirst = {'$true' if open_first else '$false'}
+
+$hwnd = [IntPtr]::Zero
+for ($i = 0; $i -lt 15; $i++) {{
+    $proc = Get-Process | Where-Object {{ $_.MainWindowTitle -like "*$appTitle*" -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+    if ($proc) {{
+        $hwnd = $proc.MainWindowHandle
         break
     }}
     Start-Sleep -Milliseconds 300
 }}
-if (-not $activated) {{
-    $activated = $wshell.AppActivate('{safe_title}')
+
+if ($hwnd -eq [IntPtr]::Zero) {{
+    Write-Output "WINDOW_NOT_FOUND: Could not locate active window matching '$appTitle'"
+    exit 0
 }}
+
+[Win32Focus]::ForceForeground($hwnd)
 Start-Sleep -Milliseconds 350
-Set-Clipboard -Value '{safe_query}'
-[System.Windows.Forms.SendKeys]::SendWait('^f')
-Start-Sleep -Milliseconds 250
-[System.Windows.Forms.SendKeys]::SendWait('^a^v')
-Start-Sleep -Milliseconds 650
-if ('{select_keys}' -ne '') {{
-    [System.Windows.Forms.SendKeys]::SendWait('{select_keys}')
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+
+# Try focusing the Search Edit control directly via UI Automation
+$editCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit
+)
+$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)
+$searchFocused = $false
+foreach ($el in $edits) {{
+    $name = $el.Current.Name
+    if ($name -match "Search|Find|chat") {{
+        $rect = $el.Current.BoundingRectangle
+        if ($rect.Width -gt 20 -and $rect.Height -gt 10) {{
+            [Win32Focus]::ClickAt([int]($rect.X + $rect.Width / 2), [int]($rect.Y + $rect.Height / 2))
+            $searchFocused = $true
+            break
+        }}
+    }}
+}}
+
+if (-not $searchFocused) {{
+    [System.Windows.Forms.SendKeys]::SendWait('^f')
+    Start-Sleep -Milliseconds 250
+}}
+
+Set-Clipboard -Value $query
+[System.Windows.Forms.SendKeys]::SendWait('^a')
+Start-Sleep -Milliseconds 80
+[System.Windows.Forms.SendKeys]::SendWait('^v')
+Start-Sleep -Milliseconds 950
+
+if ($openFirst) {{
+    # Look for matching ListItem / DataItem in UIA tree and click its center
+    $clickedName = ""
+    $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    $firstToken = ($query -split '\s+')[0]
+    foreach ($item in $all) {{
+        $ct = $item.Current.ControlType.ProgrammaticName
+        $nm = $item.Current.Name
+        if (($ct -eq "ControlType.ListItem" -or $ct -eq "ControlType.DataItem" -or $ct -eq "ControlType.Button") -and $nm -and ($nm -match [regex]::Escape($firstToken))) {{
+            $r = $item.Current.BoundingRectangle
+            if ($r.Width -gt 80 -and $r.Height -gt 28 -and $r.Y -gt 80) {{
+                [Win32Focus]::ClickAt([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+                $clickedName = $nm
+                break
+            }}
+        }}
+    }}
+
+    if ($clickedName -ne "") {{
+        Write-Output "OPENED_CHAT [$appTitle]: Searched '$query' and clicked '$clickedName'."
+    }} else {{
+        [System.Windows.Forms.SendKeys]::SendWait('{{DOWN}}{{ENTER}}')
+        Write-Output "SEARCHED_AND_SELECTED [$appTitle]: Searched '$query' (keyboard fallback)."
+    }}
+}} else {{
+    Write-Output "SEARCHED [$appTitle]: Typed '$query' in search bar."
 }}
 """
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+        res = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
             cwd="/mnt/c",
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10.0,
+            capture_output=True,
+            text=True,
+            timeout=15.0,
         )
-        action_desc = "and opened top match" if open_first else "in search bar"
-        return f"IN_APP_SEARCH [{app_name}]: Searched '{search_query}' {action_desc}."
+        out = res.stdout.strip()
+        return out if out else f"IN_APP_SEARCH [{app_name}]: Executed search for '{clean_query}'."
