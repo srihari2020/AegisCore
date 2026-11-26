@@ -72,11 +72,20 @@ class AegisAgent:
         except Exception as e:
             print(f"[Warning] Warmup skipped: {e}")
 
+    def _format_observations(self, observations: list[str]) -> str:
+        if not observations:
+            return "Completed."
+        if len(observations) == 1:
+            return observations[0].split("]: ", 1)[-1]
+        return "\n".join(observations)
+
     def run_turn(self, user_input: str, max_steps: int = 6) -> str:
         apps = self.get_installed_apps()
         recalled_mem = self.mem.recall_memories(user_input)
         recalled_skills = self.mem.recall_skills(user_input)
         observations: list[str] = []
+        executed_signatures: set[tuple[str, str, str, str]] = set()
+        is_compound = any(sep in user_input.lower() for sep in (" and ", " then ", ",", ";", " after "))
 
         for step_idx in range(max_steps):
             sys_prompt = (
@@ -85,12 +94,12 @@ class AegisAgent:
                 "EXAMPLES:\n"
                 '- User: "hey" -> {"tool":"done","target":"","value":"","extra":"","message":"Hey! Ready when you are. What would you like me to do?"}\n'
                 '- User: "open google chrome" -> {"tool":"launch_app","target":"google chrome","value":"","extra":"","message":""}\n'
-                '- User: "open youtube and search python" -> {"tool":"browser_tab","target":"https://youtube.com","value":"","extra":"open","message":""}\n'
+                '- User: "open youtube" -> {"tool":"browser_tab","target":"https://youtube.com","value":"","extra":"open","message":""}\n'
                 '- User: "save papers to D:\\Papers" -> {"tool":"save_memory","target":"rule","value":"Save research papers to D:\\Papers","extra":"","message":""}\n'
                 "RULES:\n"
-                "1. Always populate 'message' with a helpful reply when tool='done' or a specific question when tool='ask_user'. Never leave 'message' empty for those two tools.\n"
+                "1. Always populate 'message' when tool='done' or tool='ask_user'. Never leave 'message' empty for those two tools.\n"
                 "2. Never invent app names, file paths, or UI controls not in Installed Apps, Memories, or Observations.\n"
-                "3. After an action succeeds in Observations and no further steps are needed, call tool='done' with a clear confirmation in 'message'.\n\n"
+                "3. NEVER repeat an action already listed in Observations So Far—immediately call tool='done' once requested actions succeed.\n\n"
                 f"Installed Apps ({len(apps)}): {apps[:100]}\n"
                 f"Recalled Memories: {recalled_mem}\n"
                 f"Saved Skills: {recalled_skills}\n"
@@ -118,14 +127,11 @@ class AegisAgent:
             if plan.tool == "done":
                 if plan.message.strip():
                     return plan.message.strip()
-                return "\n".join(observations) if observations else "Ready. What would you like me to do?"
+                return self._format_observations(observations) if observations else "Ready. What would you like me to do?"
 
             if plan.tool == "ask_user":
-                # Guard: never block on an empty question
                 if not plan.message.strip():
-                    if observations:
-                        return "\n".join(observations)
-                    return "Could you clarify what action or application you want me to run?"
+                    return self._format_observations(observations) if observations else "Could you clarify what action you want me to run?"
                 answer = input(f"\n[AegisCore] {plan.message.strip()}\nYou: ").strip()
                 if not answer:
                     return "Action cancelled."
@@ -142,7 +148,16 @@ class AegisAgent:
                 apps = self.get_installed_apps(force_refresh=True)
                 continue
 
-            # Execute verified tool with crash-proof observation capture
+            # Circuit breaker: block duplicate execution of an already-completed action
+            sig = (
+                plan.tool,
+                plan.target.strip().lower(),
+                plan.value.strip().lower(),
+                plan.extra.strip().lower(),
+            )
+            if sig in executed_signatures:
+                return self._format_observations(observations)
+
             try:
                 obs = self._execute_tool(plan, user_input)
                 if plan.tool == "save_memory":
@@ -150,48 +165,49 @@ class AegisAgent:
             except Exception as e:
                 obs = f"TOOL_ERROR [{plan.tool}]: {e}"
 
+            executed_signatures.add(sig)
             observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
 
-        return "\n".join(observations)
+            # Fast single-intent exit: 1 LLM call, instant response, zero loop risk
+            if not is_compound and not obs.startswith(("NOT_FOUND", "TOOL_ERROR", "BRIDGE_OFFLINE", "DOWNLOAD_PENDING")):
+                return self._format_observations(observations)
+
+        return self._format_observations(observations)
 
     def _execute_tool(self, plan: AgentStepPlan, user_input: str) -> str:
-            if plan.tool == "launch_app":
-                if self.bridge_online:
-                    obs = self._call_bridge("/launch", "POST", {"app_name": plan.target})
-                else:
-                    obs = self.wsl_win.launch(plan.target)
-            elif plan.tool == "inspect_ui":
-                obs = self._call_bridge("/ui_tree", "GET", {"window_title": plan.target})
-            elif plan.tool == "click_ui":
-                obs = self._call_bridge("/click_control", "POST", {
-                    "window_title": plan.target,
-                    "control_name": plan.value,
-                })
-            elif plan.tool == "type_or_hotkey":
-                keys = [k.strip() for k in plan.extra.split("+") if k.strip()]
-                obs = self._call_bridge("/type_or_hotkey", "POST", {
-                    "text": plan.value,
-                    "keys": keys,
-                    "press_enter": plan.extra.lower() == "enter",
-                })
-            elif plan.tool == "browser_tab":
-                obs = self.browser.tab_action(plan.extra or "open", plan.target)
-            elif plan.tool == "download_item":
-                obs = self.browser.download_item(plan.target, plan.value, plan.extra or "auto")
-            elif plan.tool == "file_ops":
-                obs = self._call_bridge("/file_ops", "POST", {
-                    "action": plan.extra or "find",
-                    "source": plan.target,
-                    "dest": plan.value,
-                })
-            elif plan.tool == "save_memory":
-                saved = self.mem.add_memory(plan.value, plan.target or "preference")
-                recalled_mem = self.mem.recall_memories(user_input)
-                obs = f"MEMORIZED: {saved}"
-            elif plan.tool == "save_skill":
-                steps_list = [s.strip() for s in plan.extra.split(";") if s.strip()]
-                saved = self.mem.save_skill(plan.target, plan.value, steps_list)
-                obs = f"SKILL_SAVED: {saved}"
-            else:
-                obs = f"UNHANDLED_TOOL: {plan.tool}"
-            return obs
+        if plan.tool == "launch_app":
+            if self.bridge_online:
+                return self._call_bridge("/launch", "POST", {"app_name": plan.target})
+            return self.wsl_win.launch(plan.target)
+        elif plan.tool == "inspect_ui":
+            return self._call_bridge("/ui_tree", "GET", {"window_title": plan.target})
+        elif plan.tool == "click_ui":
+            return self._call_bridge("/click_control", "POST", {
+                "window_title": plan.target,
+                "control_name": plan.value,
+            })
+        elif plan.tool == "type_or_hotkey":
+            keys = [k.strip() for k in plan.extra.split("+") if k.strip()]
+            return self._call_bridge("/type_or_hotkey", "POST", {
+                "text": plan.value,
+                "keys": keys,
+                "press_enter": plan.extra.lower() == "enter",
+            })
+        elif plan.tool == "browser_tab":
+            return self.browser.tab_action(plan.extra or "open", plan.target)
+        elif plan.tool == "download_item":
+            return self.browser.download_item(plan.target, plan.value, plan.extra or "auto")
+        elif plan.tool == "file_ops":
+            return self._call_bridge("/file_ops", "POST", {
+                "action": plan.extra or "find",
+                "source": plan.target,
+                "dest": plan.value,
+            })
+        elif plan.tool == "save_memory":
+            saved = self.mem.add_memory(plan.value, plan.target or "preference")
+            return f"Memorized: {saved}"
+        elif plan.tool == "save_skill":
+            steps_list = [s.strip() for s in plan.extra.split(";") if s.strip()]
+            saved = self.mem.save_skill(plan.target, plan.value, steps_list)
+            return f"Saved skill: {saved}"
+        return f"UNHANDLED_TOOL: {plan.tool}"
