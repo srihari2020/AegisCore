@@ -5,6 +5,7 @@ import httpx
 from ollama import chat
 from memory.store import AegisMemory
 from hands.browser import BrowserHands
+from hands.wsl_windows import WSLWindowsInterop
 from brain.schema import AgentStepPlan
 from brain.verifier import verify_step
 
@@ -23,6 +24,7 @@ class AegisAgent:
         self.model = model_name
         self.mem = AegisMemory()
         self.browser = BrowserHands()
+        self.wsl_win = WSLWindowsInterop()
         self.bridge = get_win_bridge_url()
         self.bridge_online = False
         self._apps_cache: list[str] = []
@@ -33,16 +35,19 @@ class AegisAgent:
         now = time.time()
         if not force_refresh and self._apps_cache and (now - self._apps_cache_ts) < 30.0:
             return self._apps_cache
+
+        apps_set = set(self.wsl_win.scan_apps().keys())
         try:
-            r = httpx.get(f"{self.bridge}/apps", timeout=1.5)
-            apps = sorted(r.json().get("apps", {}).keys())
+            r = httpx.get(f"{self.bridge}/apps", timeout=1.0)
+            apps_set.update(r.json().get("apps", {}).keys())
             self.bridge_online = True
-            self._apps_cache = apps
-            self._apps_cache_ts = now
-            return apps
         except Exception:
             self.bridge_online = False
-            return ["chromium", "terminal", "vscode"]
+
+        apps = sorted(apps_set) if apps_set else ["chromium", "terminal", "vscode"]
+        self._apps_cache = apps
+        self._apps_cache_ts = now
+        return apps
 
     def _call_bridge(self, endpoint: str, method: str = "POST", payload: dict | None = None) -> str:
         try:
@@ -54,13 +59,9 @@ class AegisAgent:
             return str(r.json())
         except Exception as e:
             self.bridge_online = False
-            return (
-                f"WINDOWS_BRIDGE_OFFLINE at {self.bridge}. "
-                f"Start it on Windows with: python \\\\wsl$\\Ubuntu\\home\\srihari\\projects\\AegisCore\\bridge\\win_host_server.py ({e})"
-            )
+            return f"BRIDGE_OFFLINE ({e})"
 
     def warmup(self):
-        """Pins the model in GPU VRAM indefinitely so commands execute with zero cold-start lag."""
         try:
             chat(
                 model=self.model,
@@ -79,21 +80,21 @@ class AegisAgent:
 
         for step_idx in range(max_steps):
             sys_prompt = (
-                "You are AegisCore, a zero-hallucination local PC automation agent.\n"
-                "Return valid JSON matching the AgentStepPlan schema.\n"
-                "STRICT RULES:\n"
-                "1. For greetings, chat, or general questions requiring no PC action, immediately set tool='done' and write a clear, concise response in final_answer.\n"
-                "2. Never invent app names, file paths, or UI controls not present in Context or Observations.\n"
-                "3. Copy exact app names verbatim from Installed Apps.\n"
-                "4. If required information (folder path, target recipient, ambiguous app, destructive action) is missing, choose tool='ask_user'.\n"
-                "5. After launching an unfamiliar app, call tool='inspect_ui' before calling 'click_ui'.\n"
-                "6. When the user states a preference or correction, call tool='save_memory'.\n"
-                "7. Only choose tool='done' after all requested actions succeed or when answering directly.\n\n"
-                f"Windows Bridge Online: {self.bridge_online}\n"
-                f"Installed Apps ({len(apps)} total, sample): {apps[:90]}\n"
+                "You are AegisCore, a fast, zero-hallucination local PC automation agent.\n"
+                "Respond ONLY with JSON matching AgentStepPlan: {tool, target, value, extra, message}.\n"
+                "EXAMPLES:\n"
+                '- User: "hey" -> {"tool":"done","target":"","value":"","extra":"","message":"Hey! Ready when you are. What would you like me to do?"}\n'
+                '- User: "open google chrome" -> {"tool":"launch_app","target":"google chrome","value":"","extra":"","message":""}\n'
+                '- User: "open youtube and search python" -> {"tool":"browser_tab","target":"https://youtube.com","value":"","extra":"open","message":""}\n'
+                '- User: "save papers to D:\\Papers" -> {"tool":"save_memory","target":"rule","value":"Save research papers to D:\\Papers","extra":"","message":""}\n'
+                "RULES:\n"
+                "1. Always populate 'message' with a helpful reply when tool='done' or a specific question when tool='ask_user'. Never leave 'message' empty for those two tools.\n"
+                "2. Never invent app names, file paths, or UI controls not in Installed Apps, Memories, or Observations.\n"
+                "3. After an action succeeds in Observations and no further steps are needed, call tool='done' with a clear confirmation in 'message'.\n\n"
+                f"Installed Apps ({len(apps)}): {apps[:100]}\n"
                 f"Recalled Memories: {recalled_mem}\n"
                 f"Saved Skills: {recalled_skills}\n"
-                f"Execution Observations So Far: {observations}"
+                f"Observations So Far: {observations}"
             )
 
             resp = chat(
@@ -108,64 +109,80 @@ class AegisAgent:
                     "temperature": 0,
                     "top_p": 0.9,
                     "num_ctx": 4096,
-                    "num_predict": 256,
+                    "num_predict": 128,
                 },
             )
 
             plan = AgentStepPlan.model_validate_json(resp.message.content)
-            step = plan.step
 
-            if step.tool == "done":
-                return step.final_answer or ("\n".join(observations) if observations else "Completed.")
+            if plan.tool == "done":
+                if plan.message.strip():
+                    return plan.message.strip()
+                return "\n".join(observations) if observations else "Ready. What would you like me to do?"
 
-            if step.tool == "ask_user":
-                answer = input(f"\n[AegisCore] {step.question}\nYou: ").strip()
+            if plan.tool == "ask_user":
+                # Guard: never block on an empty question
+                if not plan.message.strip():
+                    if observations:
+                        return "\n".join(observations)
+                    return "Could you clarify what action or application you want me to run?"
+                answer = input(f"\n[AegisCore] {plan.message.strip()}\nYou: ").strip()
+                if not answer:
+                    return "Action cancelled."
                 user_input = f"{user_input} | User answered: {answer}"
                 recalled_mem = self.mem.recall_memories(user_input)
                 continue
 
-            is_valid, note, step = verify_step(step, apps, observations)
+            is_valid, note, plan = verify_step(plan, apps)
             if not is_valid:
                 answer = input(f"\n[AegisCore Verification] {note}\nYou: ").strip()
+                if not answer:
+                    return "Action cancelled."
                 user_input = f"{user_input} | User clarification: {answer}"
                 apps = self.get_installed_apps(force_refresh=True)
                 continue
 
-            if step.tool == "launch_app":
-                obs = self._call_bridge("/launch", "POST", {"app_name": step.app_name})
-            elif step.tool == "inspect_ui":
-                obs = self._call_bridge("/ui_tree", "GET", {"window_title": step.window_title})
-            elif step.tool == "click_ui":
+            # Execute verified tool
+            if plan.tool == "launch_app":
+                if self.bridge_online:
+                    obs = self._call_bridge("/launch", "POST", {"app_name": plan.target})
+                else:
+                    obs = self.wsl_win.launch(plan.target)
+            elif plan.tool == "inspect_ui":
+                obs = self._call_bridge("/ui_tree", "GET", {"window_title": plan.target})
+            elif plan.tool == "click_ui":
                 obs = self._call_bridge("/click_control", "POST", {
-                    "window_title": step.window_title,
-                    "control_name": step.control_name,
+                    "window_title": plan.target,
+                    "control_name": plan.value,
                 })
-            elif step.tool == "type_or_hotkey":
+            elif plan.tool == "type_or_hotkey":
+                keys = [k.strip() for k in plan.extra.split("+") if k.strip()]
                 obs = self._call_bridge("/type_or_hotkey", "POST", {
-                    "text": step.text,
-                    "keys": step.keys,
-                    "press_enter": step.press_enter,
+                    "text": plan.value,
+                    "keys": keys,
+                    "press_enter": plan.extra.lower() == "enter",
                 })
-            elif step.tool == "browser_tab":
-                obs = self.browser.tab_action(step.browser_action or "open", step.url_or_query)
-            elif step.tool == "download_item":
-                obs = self.browser.download_item(step.url_or_query, step.save_dir, step.filename)
-            elif step.tool == "file_ops":
+            elif plan.tool == "browser_tab":
+                obs = self.browser.tab_action(plan.extra or "open", plan.target)
+            elif plan.tool == "download_item":
+                obs = self.browser.download_item(plan.target, plan.value, plan.extra or "auto")
+            elif plan.tool == "file_ops":
                 obs = self._call_bridge("/file_ops", "POST", {
-                    "action": step.file_action,
-                    "source": step.source,
-                    "dest": step.dest,
+                    "action": plan.extra or "find",
+                    "source": plan.target,
+                    "dest": plan.value,
                 })
-            elif step.tool == "save_memory":
-                saved = self.mem.add_memory(step.fact, step.category)
+            elif plan.tool == "save_memory":
+                saved = self.mem.add_memory(plan.value, plan.target or "preference")
                 recalled_mem = self.mem.recall_memories(user_input)
                 obs = f"MEMORIZED: {saved}"
-            elif step.tool == "save_skill":
-                saved = self.mem.save_skill(step.skill_name, step.trigger_phrase, step.steps)
+            elif plan.tool == "save_skill":
+                steps_list = [s.strip() for s in plan.extra.split(";") if s.strip()]
+                saved = self.mem.save_skill(plan.target, plan.value, steps_list)
                 obs = f"SKILL_SAVED: {saved}"
             else:
-                obs = f"UNHANDLED_TOOL: {step.tool}"
+                obs = f"UNHANDLED_TOOL: {plan.tool}"
 
-            observations.append(f"Step {step_idx + 1} [{step.tool}]: {obs}")
+            observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
 
         return "\n".join(observations)

@@ -1,5 +1,5 @@
 import difflib
-from brain.schema import ToolStep
+from brain.schema import AgentStepPlan
 
 APP_ALIASES = {
     "google chrome": ["google chrome", "chrome", "chromium"],
@@ -10,61 +10,52 @@ APP_ALIASES = {
     "edge": ["microsoft edge", "msedge"],
 }
 
-def verify_step(step: ToolStep, installed_apps: list[str], observations: list[str]) -> tuple[bool, str, ToolStep]:
-    """
-    Validates a model-proposed step against real OS state before execution.
-    Returns (is_valid, reason_or_override_question, step).
-    """
-    if step.tool == "launch_app":
-        query = step.app_name.strip().lower()
+def verify_step(plan: AgentStepPlan, installed_apps: list[str]) -> tuple[bool, str, AgentStepPlan]:
+    if plan.tool == "launch_app":
+        query = plan.target.strip().lower()
         if not query:
-            return False, "Which application would you like me to open?", step
+            return False, "Which application would you like me to open?", plan
 
-        # 1. Exact match
         if query in installed_apps:
-            return True, "verified", step
+            return True, "verified", plan
 
-        # 2. Alias expansion (e.g., 'google chrome' -> 'chrome')
         for alias in APP_ALIASES.get(query, []):
             if alias in installed_apps:
-                step.app_name = alias
-                return True, f"Resolved alias '{query}' -> '{alias}'", step
+                plan.target = alias
+                return True, f"Resolved alias '{query}' -> '{alias}'", plan
 
-        # 3. Substring match
         partial = [a for a in installed_apps if query in a or a in query]
         if partial:
-            step.app_name = partial[0]
-            return True, f"Matched installed app '{partial[0]}'", step
+            plan.target = partial[0]
+            return True, f"Matched installed app '{partial[0]}'", plan
 
-        # 4. High-confidence typo auto-correction (e.g., 'chromeium' -> 'chromium')
-        high_conf = difflib.get_close_matches(query, installed_apps, n=1, cutoff=0.82)
+        high_conf = difflib.get_close_matches(query, installed_apps, n=1, cutoff=0.80)
         if high_conf:
-            step.app_name = high_conf[0]
-            return True, f"Corrected typo '{query}' -> '{high_conf[0]}'", step
+            plan.target = high_conf[0]
+            return True, f"Corrected '{query}' -> '{high_conf[0]}'", plan
 
-        # 5. Genuinely missing app -> block hallucination and ask user
-        close = difflib.get_close_matches(query, installed_apps, n=3, cutoff=0.55)
+        close = difflib.get_close_matches(query, installed_apps, n=3, cutoff=0.50)
         suggestion = f" Closest installed matches: {close}." if close else ""
         return (
             False,
-            f"'{step.app_name}' was not found in your installed apps.{suggestion} Should I search and download it or open another app?",
-            step,
+            f"'{plan.target}' is not installed.{suggestion} Should I search and download it or open a different app?",
+            plan,
         )
 
-    elif step.tool == "download_item":
-        if not step.save_dir.strip():
-            return False, "Where should I save this download? (Once you tell me, I'll remember it for next time.)", step
-        if not step.url_or_query.strip():
-            return False, "Which exact link or search result should I download?", step
+    elif plan.tool == "download_item":
+        if not plan.value.strip():
+            return False, "Which folder should I save this download into? (I'll remember it for next time.)", plan
+        if not plan.target.strip():
+            return False, "Which exact link or search result should I download?", plan
 
-    elif step.tool == "click_ui":
-        if not step.control_name.strip():
-            return False, "Which button or menu item should I click inside the active window?", step
+    elif plan.tool == "click_ui":
+        if not plan.value.strip():
+            return False, "Which button or menu item should I click inside the active window?", plan
 
-    elif step.tool == "file_ops":
-        if step.file_action not in {"find", "move"}:
-            return False, "Only 'find' and 'move' are permitted automatically. Do you want me to proceed?", step
-        if not step.source.strip():
-            return False, "Which file or folder path should I operate on?", step
+    elif plan.tool == "file_ops":
+        if plan.extra not in {"find", "move"}:
+            return False, "Only 'find' and 'move' are permitted automatically. Do you want me to proceed?", plan
+        if not plan.target.strip():
+            return False, "Which file or folder path should I operate on?", plan
 
-    return True, "verified", step
+    return True, "verified", plan

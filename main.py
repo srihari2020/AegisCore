@@ -20,8 +20,8 @@ def main():
     print(f"Warming up {model} in GPU VRAM...")
     agent.warmup()
     apps = agent.get_installed_apps(force_refresh=True)
-    bridge_status = f"ONLINE ({len(apps)} Windows apps indexed)" if agent.bridge_online else "OFFLINE (Windows apps unavailable until win_host_server.py runs)"
-    print(f"AegisCore Online | Model: {model} | Bridge: {agent.bridge} [{bridge_status}]")
+    mode = "Full UIA Bridge" if agent.bridge_online else "WSL2 Direct Interop"
+    print(f"AegisCore Online | Model: {model} | Mode: {mode} | Indexed Apps: {len(apps)}")
     print("Type a command (or 'exit' to quit):\n")
 
     while True:
