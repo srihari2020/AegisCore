@@ -5,6 +5,8 @@ ToolName = Literal[
     "done",
     "launch_app",
     "in_app_search",
+    "send_message",
+    "send_sticker",
     "browser_tab",
     "download_item",
     "inspect_ui",
@@ -24,11 +26,11 @@ class AgentStepPlan(BaseModel):
     )
     value: str = Field(
         default="",
-        description="Search query inside app, UI control name, download save_dir, destination path, text/keys, memory fact, or skill trigger.",
+        description="Message text, sticker hint, search query, UI control name, save_dir, destination path, or memory fact.",
     )
     extra: str = Field(
         default="",
-        description="in_app_search mode (open_first|search_only), browser_tab action (open|search|close), file_ops action (find|move), filename, or skill steps.",
+        description="Recipient contact name (for send_message/send_sticker), in_app_search mode, browser_tab action, file_ops action, or skill steps.",
     )
     message: str = Field(
         default="",

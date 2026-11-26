@@ -9,6 +9,12 @@ from hands.wsl_windows import WSLWindowsInterop
 from brain.schema import AgentStepPlan
 from brain.verifier import verify_step
 
+ACTION_VERBS = (
+    "open ", "launch ", "start ", "send ", "message ", "reply ", "type ",
+    "click ", "press ", "search ", "find ", "download ", "save ", "remember ",
+    "close ", "move ", "delete ", "inspect ", "run ",
+)
+
 def get_win_bridge_url() -> str:
     if os.environ.get("AEGIS_WIN_BRIDGE"):
         return os.environ["AEGIS_WIN_BRIDGE"]
@@ -30,6 +36,7 @@ class AegisAgent:
         self._apps_cache: list[str] = []
         self._apps_cache_ts: float = 0.0
         self._schema = AgentStepPlan.model_json_schema()
+        self.recent_turns: list[str] = []
 
     def get_installed_apps(self, force_refresh: bool = False) -> list[str]:
         now = time.time()
@@ -79,6 +86,10 @@ class AegisAgent:
             return observations[0].split("]: ", 1)[-1]
         return "\n".join(observations)
 
+    def _looks_like_action_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        return any(low.startswith(v) or f" {v}" in f" {low}" for v in ACTION_VERBS)
+
     def run_turn(self, user_input: str, max_steps: int = 6) -> str:
         apps = self.get_installed_apps()
         recalled_mem = self.mem.recall_memories(user_input)
@@ -86,6 +97,7 @@ class AegisAgent:
         observations: list[str] = []
         executed_signatures: set[tuple[str, str, str, str]] = set()
         is_compound = any(sep in user_input.lower() for sep in (" and ", " then ", ",", ";", " after "))
+        promise_retries = 0
 
         for step_idx in range(max_steps):
             sys_prompt = (
@@ -94,15 +106,18 @@ class AegisAgent:
                 "EXAMPLES:\n"
                 '- User: "hey" -> {"tool":"done","target":"","value":"","extra":"","message":"Hey! Ready when you are. What would you like me to do?"}\n'
                 '- User: "open whatsapp" -> {"tool":"launch_app","target":"whatsapp","value":"","extra":"","message":""}\n'
-                '- User: "in whatsapp open message for gopi Niat friend" -> {"tool":"in_app_search","target":"whatsapp","value":"gopi Niat friend","extra":"open_first","message":""}\n'
+                '- User: "in whatsapp open message for gopi" -> {"tool":"in_app_search","target":"whatsapp","value":"gopi","extra":"open_first","message":""}\n'
+                '- User: "send gopi a sticker" -> {"tool":"send_sticker","target":"whatsapp","value":"","extra":"gopi","message":""}\n'
+                '- User: "send gopi hello bro" -> {"tool":"send_message","target":"whatsapp","value":"hello bro","extra":"gopi","message":""}\n'
                 '- User: "open youtube" -> {"tool":"browser_tab","target":"https://youtube.com","value":"","extra":"open","message":""}\n'
                 '- User: "save papers to D:\\Papers" -> {"tool":"save_memory","target":"rule","value":"Save research papers to D:\\Papers","extra":"","message":""}\n'
                 "RULES:\n"
-                "1. When the user says 'in <app> open chat/message for <name>' or 'search <text> in <app>', IMMEDIATELY call tool='in_app_search' with target=<app>, value=<name/text>, extra='open_first'. If Recalled Memories maps that nickname to a saved contact name, use the saved contact name.\n"
+                "1. NEVER reply with tool='done' saying 'I will do X' without actually executing a tool first.\n"
                 "2. Always populate 'message' when tool='done' or tool='ask_user'. Never leave 'message' empty for those two tools.\n"
                 "3. Never invent app names, file paths, or UI controls not in Installed Apps, Memories, or Observations.\n"
                 "4. NEVER repeat an action already listed in Observations So Far—immediately call tool='done' once requested actions succeed.\n\n"
                 f"Installed Apps ({len(apps)}): {apps[:110]}\n"
+                f"Recent Session History: {self.recent_turns[-4:]}\n"
                 f"Recalled Memories: {recalled_mem}\n"
                 f"Saved Skills: {recalled_skills}\n"
                 f"Observations So Far: {observations}"
@@ -127,9 +142,17 @@ class AegisAgent:
             plan = AgentStepPlan.model_validate_json(resp.message.content)
 
             if plan.tool == "done":
-                if plan.message.strip():
-                    return plan.message.strip()
-                return self._format_observations(observations) if observations else "Ready. What would you like me to do?"
+                # Zero-Promise Guard: block hallucinated promises when no tool has executed yet
+                if not observations and self._looks_like_action_request(user_input) and promise_retries < 2:
+                    promise_retries += 1
+                    observations.append("SYSTEM_WARNING: You returned tool='done' without executing any tool. Execute the matching tool now.")
+                    continue
+                observations = [o for o in observations if not o.startswith("SYSTEM_WARNING:")]
+                final_out = plan.message.strip() or (self._format_observations(observations) if observations else "Ready. What would you like me to do?")
+                self.recent_turns.append(f"User: {user_input} -> AegisCore: {final_out}")
+                return final_out
+
+            observations = [o for o in observations if not o.startswith("SYSTEM_WARNING:")]
 
             if plan.tool == "ask_user":
                 if not plan.message.strip():
@@ -157,7 +180,9 @@ class AegisAgent:
                 plan.extra.strip().lower(),
             )
             if sig in executed_signatures:
-                return self._format_observations(observations)
+                out = self._format_observations(observations)
+                self.recent_turns.append(f"User: {user_input} -> AegisCore: {out}")
+                return out
 
             try:
                 obs = self._execute_tool(plan, user_input)
@@ -170,9 +195,13 @@ class AegisAgent:
             observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
 
             if not is_compound and not obs.startswith(("NOT_FOUND", "TOOL_ERROR", "BRIDGE_OFFLINE", "DOWNLOAD_PENDING")):
-                return self._format_observations(observations)
+                out = self._format_observations(observations)
+                self.recent_turns.append(f"User: {user_input} -> AegisCore: {out}")
+                return out
 
-        return self._format_observations(observations)
+        out = self._format_observations(observations)
+        self.recent_turns.append(f"User: {user_input} -> AegisCore: {out}")
+        return out
 
     def _execute_tool(self, plan: AgentStepPlan, user_input: str) -> str:
         if plan.tool == "launch_app":
@@ -182,13 +211,21 @@ class AegisAgent:
         elif plan.tool == "in_app_search":
             open_first = plan.extra.strip().lower() != "search_only"
             return self.wsl_win.in_app_search(plan.target, plan.value, open_first=open_first)
+        elif plan.tool == "send_message":
+            return self.wsl_win.send_message(plan.target or "whatsapp", plan.value, recipient=plan.extra)
+        elif plan.tool == "send_sticker":
+            return self.wsl_win.send_sticker(plan.target or "whatsapp", recipient=plan.extra, hint=plan.value)
         elif plan.tool == "inspect_ui":
-            return self._call_bridge("/ui_tree", "GET", {"window_title": plan.target})
+            if self.bridge_online:
+                return self._call_bridge("/ui_tree", "GET", {"window_title": plan.target})
+            return self.wsl_win.inspect_ui(plan.target)
         elif plan.tool == "click_ui":
-            return self._call_bridge("/click_control", "POST", {
-                "window_title": plan.target,
-                "control_name": plan.value,
-            })
+            if self.bridge_online:
+                return self._call_bridge("/click_control", "POST", {
+                    "window_title": plan.target,
+                    "control_name": plan.value,
+                })
+            return self.wsl_win.click_ui(plan.target, plan.value)
         elif plan.tool == "type_or_hotkey":
             keys = [k.strip() for k in plan.extra.split("+") if k.strip()]
             return self._call_bridge("/type_or_hotkey", "POST", {
