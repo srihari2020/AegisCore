@@ -1,5 +1,6 @@
 import difflib
 from brain.schema import AgentStepPlan
+from perception.media_reader import resolve_wsl_path
 
 APP_ALIASES = {
     "google chrome": ["google chrome", "chrome", "chromium"],
@@ -50,6 +51,18 @@ def verify_step(plan: AgentStepPlan, installed_apps: list[str]) -> tuple[bool, s
             f"'{plan.target}' is not installed.{suggestion} Should I search and download it or open a different app?",
             plan,
         )
+
+    elif plan.tool in {"read_document", "watch_video"}:
+        raw_target = plan.target.strip()
+        if not raw_target:
+            return False, "Which exact local file path would you like me to read or analyze?", plan
+        resolved = resolve_wsl_path(raw_target)
+        if not resolved.is_file():
+            return (
+                False,
+                f"I couldn't find '{raw_target}' on disk. Please provide the exact local file path (or tell me if you meant a YouTube/browser video).",
+                plan,
+            )
 
     elif plan.tool == "download_item":
         if not plan.value.strip():

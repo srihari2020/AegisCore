@@ -25,8 +25,11 @@ class BrowserHands:
         self._browser = None
         self._context = None
         self._pages = []
+        self.last_url: str = ""
+        self.last_youtube_query: str = ""
 
     def _open_in_windows_browser(self, url: str) -> str:
+        self.last_url = url
         subprocess.Popen(
             ["cmd.exe", "/c", "start", "", url],
             cwd="/mnt/c",
@@ -49,14 +52,12 @@ class BrowserHands:
             return SITE_SHORTCUTS[low]
         if clean.startswith(("http://", "https://")):
             return clean
-        # Valid domain/host check (must contain a dot or localhost, and no spaces)
         if " " not in clean and ("." in clean or clean.startswith("localhost")):
             return f"https://{clean}"
-        # Otherwise treat bare words/phrases as a Google search instead of a broken DNS host
         return f"https://www.google.com/search?q={quote_plus(clean)}"
 
     def _resolve_youtube_top_video(self, query: str) -> str | None:
-        """Fetches YouTube search HTML and extracts the top playable watch URL in ~300ms."""
+        """Resolves the top playable YouTube watch?v= URL for a search query."""
         try:
             headers = {
                 "User-Agent": (
@@ -83,14 +84,19 @@ class BrowserHands:
         clean = url_or_query.strip()
         act = (action or "open").strip().lower()
 
-        if act in {"youtube_play", "play_youtube"}:
-            watch_url = self._resolve_youtube_top_video(clean)
+        if act in {"youtube_play", "play_youtube", "play_last"}:
+            query = clean or self.last_youtube_query
+            if not query:
+                return "NO_YOUTUBE_QUERY: Tell me which video or creator you want to play."
+            self.last_youtube_query = query
+            watch_url = self._resolve_youtube_top_video(query)
             if watch_url:
-                return self._open_in_windows_browser(watch_url) + f" (Top YouTube match for '{clean}')"
-            yt_search = f"https://www.youtube.com/results?search_query={quote_plus(clean)}"
+                return self._open_in_windows_browser(watch_url) + f" (Playing top YouTube result for '{query}')"
+            yt_search = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
             return self._open_in_windows_browser(yt_search)
 
         if act == "youtube_search":
+            self.last_youtube_query = clean
             yt_search = f"https://www.youtube.com/results?search_query={quote_plus(clean)}"
             return self._open_in_windows_browser(yt_search)
 
@@ -99,9 +105,12 @@ class BrowserHands:
             return self._open_in_windows_browser(target)
 
         if act == "search":
-            # Detect "... on youtube" inside generic search queries
             yt_match = re.sub(r"\s+on\s+youtube$", "", clean, flags=re.IGNORECASE).strip()
-            if yt_match != clean:
+            if yt_match != clean or "youtube" in clean.lower() or "video" in clean.lower():
+                self.last_youtube_query = yt_match
+                watch_url = self._resolve_youtube_top_video(yt_match)
+                if watch_url:
+                    return self._open_in_windows_browser(watch_url) + f" (Playing top YouTube result for '{yt_match}')"
                 yt_search = f"https://www.youtube.com/results?search_query={quote_plus(yt_match)}"
                 return self._open_in_windows_browser(yt_search)
             query_url = f"https://www.google.com/search?q={quote_plus(clean)}"
