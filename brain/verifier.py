@@ -1,6 +1,15 @@
 import difflib
 from brain.schema import ToolStep
 
+APP_ALIASES = {
+    "google chrome": ["google chrome", "chrome", "chromium"],
+    "chrome": ["chrome", "google chrome", "chromium"],
+    "vs code": ["visual studio code", "vscode", "code"],
+    "vscode": ["vscode", "visual studio code", "code"],
+    "file explorer": ["file explorer", "explorer"],
+    "edge": ["microsoft edge", "msedge"],
+}
+
 def verify_step(step: ToolStep, installed_apps: list[str], observations: list[str]) -> tuple[bool, str, ToolStep]:
     """
     Validates a model-proposed step against real OS state before execution.
@@ -10,14 +19,37 @@ def verify_step(step: ToolStep, installed_apps: list[str], observations: list[st
         query = step.app_name.strip().lower()
         if not query:
             return False, "Which application would you like me to open?", step
-        if installed_apps and query not in installed_apps:
-            partial = [a for a in installed_apps if query in a or a in query]
-            if partial:
-                step.app_name = partial[0]
-                return True, f"Matched installed app '{partial[0]}'", step
-            close = difflib.get_close_matches(query, installed_apps, n=3, cutoff=0.6)
-            suggestion = f" Closest installed matches: {close}." if close else ""
-            return False, f"'{step.app_name}' was not found in your installed apps.{suggestion} Should I search and download it or open another app?", step
+
+        # 1. Exact match
+        if query in installed_apps:
+            return True, "verified", step
+
+        # 2. Alias expansion (e.g., 'google chrome' -> 'chrome')
+        for alias in APP_ALIASES.get(query, []):
+            if alias in installed_apps:
+                step.app_name = alias
+                return True, f"Resolved alias '{query}' -> '{alias}'", step
+
+        # 3. Substring match
+        partial = [a for a in installed_apps if query in a or a in query]
+        if partial:
+            step.app_name = partial[0]
+            return True, f"Matched installed app '{partial[0]}'", step
+
+        # 4. High-confidence typo auto-correction (e.g., 'chromeium' -> 'chromium')
+        high_conf = difflib.get_close_matches(query, installed_apps, n=1, cutoff=0.82)
+        if high_conf:
+            step.app_name = high_conf[0]
+            return True, f"Corrected typo '{query}' -> '{high_conf[0]}'", step
+
+        # 5. Genuinely missing app -> block hallucination and ask user
+        close = difflib.get_close_matches(query, installed_apps, n=3, cutoff=0.55)
+        suggestion = f" Closest installed matches: {close}." if close else ""
+        return (
+            False,
+            f"'{step.app_name}' was not found in your installed apps.{suggestion} Should I search and download it or open another app?",
+            step,
+        )
 
     elif step.tool == "download_item":
         if not step.save_dir.strip():

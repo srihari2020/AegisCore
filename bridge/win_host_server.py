@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from pywinauto import Desktop
 import pyautogui
+import uvicorn
 
 app = FastAPI(title="AegisCore Windows Host Bridge")
 
@@ -34,11 +35,13 @@ def health():
 @app.get("/apps")
 def scan_installed_apps():
     apps = {}
-    start_dirs = [
-        Path(os.environ["PROGRAMDATA"]) / r"Microsoft\Windows\Start Menu\Programs",
-        Path(os.environ["APPDATA"]) / r"Microsoft\Windows\Start Menu\Programs",
+    shortcut_dirs = [
+        Path(os.environ.get("PROGRAMDATA", "")) / r"Microsoft\Windows\Start Menu\Programs",
+        Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs",
+        Path(os.environ.get("USERPROFILE", "")) / "Desktop",
+        Path(os.environ.get("PUBLIC", "")) / "Desktop",
     ]
-    for base in start_dirs:
+    for base in shortcut_dirs:
         if base.exists():
             for lnk in base.rglob("*.lnk"):
                 apps[lnk.stem.lower()] = str(lnk)
@@ -55,6 +58,18 @@ def scan_installed_apps():
                             apps[Path(sub).stem.lower()] = exe_path.strip('"')
         except OSError:
             continue
+
+    # Ensure common browsers/tools are indexed even if omitted from Start Menu
+    common_bins = {
+        "google chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "brave": r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "msedge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    }
+    for name, path in common_bins.items():
+        if Path(path).exists() and name not in apps:
+            apps[name] = path
+
     return {"apps": apps}
 
 @app.post("/launch")
@@ -63,7 +78,7 @@ def launch_app(req: LaunchReq):
     query = req.app_name.lower().strip()
     target = apps.get(query)
     if not target:
-        matches = [k for k in apps if query in k]
+        matches = [k for k in apps if query in k or k in query]
         if not matches:
             return {"status": "not_found", "available_sample": list(apps.keys())[:30]}
         target = apps[matches[0]]
@@ -112,3 +127,6 @@ def file_ops(req: FileOpReq):
         shutil.move(str(src), str(dst / src.name))
         return {"status": "moved", "to": str(dst / src.name)}
     return {"status": "unsupported_or_requires_confirmation"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8765)

@@ -24,22 +24,25 @@ class AegisAgent:
         self.mem = AegisMemory()
         self.browser = BrowserHands()
         self.bridge = get_win_bridge_url()
+        self.bridge_online = False
         self._apps_cache: list[str] = []
         self._apps_cache_ts: float = 0.0
         self._schema = AgentStepPlan.model_json_schema()
 
-    def _get_installed_apps(self, force_refresh: bool = False) -> list[str]:
+    def get_installed_apps(self, force_refresh: bool = False) -> list[str]:
         now = time.time()
         if not force_refresh and self._apps_cache and (now - self._apps_cache_ts) < 30.0:
             return self._apps_cache
         try:
             r = httpx.get(f"{self.bridge}/apps", timeout=1.5)
             apps = sorted(r.json().get("apps", {}).keys())
+            self.bridge_online = True
             self._apps_cache = apps
             self._apps_cache_ts = now
             return apps
         except Exception:
-            return self._apps_cache or ["chromium", "terminal", "vscode"]
+            self.bridge_online = False
+            return ["chromium", "terminal", "vscode"]
 
     def _call_bridge(self, endpoint: str, method: str = "POST", payload: dict | None = None) -> str:
         try:
@@ -47,9 +50,14 @@ class AegisAgent:
                 r = httpx.get(f"{self.bridge}{endpoint}", params=payload, timeout=5.0)
             else:
                 r = httpx.post(f"{self.bridge}{endpoint}", json=payload, timeout=5.0)
+            self.bridge_online = True
             return str(r.json())
         except Exception as e:
-            return f"BRIDGE_OFFLINE: {self.bridge} ({e})"
+            self.bridge_online = False
+            return (
+                f"WINDOWS_BRIDGE_OFFLINE at {self.bridge}. "
+                f"Start it on Windows with: python \\\\wsl$\\Ubuntu\\home\\srihari\\projects\\AegisCore\\bridge\\win_host_server.py ({e})"
+            )
 
     def warmup(self):
         """Pins the model in GPU VRAM indefinitely so commands execute with zero cold-start lag."""
@@ -64,7 +72,7 @@ class AegisAgent:
             print(f"[Warning] Warmup skipped: {e}")
 
     def run_turn(self, user_input: str, max_steps: int = 6) -> str:
-        apps = self._get_installed_apps()
+        apps = self.get_installed_apps()
         recalled_mem = self.mem.recall_memories(user_input)
         recalled_skills = self.mem.recall_skills(user_input)
         observations: list[str] = []
@@ -76,10 +84,12 @@ class AegisAgent:
                 "STRICT RULES:\n"
                 "1. For greetings, chat, or general questions requiring no PC action, immediately set tool='done' and write a clear, concise response in final_answer.\n"
                 "2. Never invent app names, file paths, or UI controls not present in Context or Observations.\n"
-                "3. If required information (folder path, target recipient, ambiguous app, destructive action) is missing, choose tool='ask_user'.\n"
-                "4. After launching an unfamiliar app, call tool='inspect_ui' before calling 'click_ui'.\n"
-                "5. When the user states a preference or correction, call tool='save_memory'.\n"
-                "6. Only choose tool='done' after all requested actions succeed or when answering directly.\n\n"
+                "3. Copy exact app names verbatim from Installed Apps.\n"
+                "4. If required information (folder path, target recipient, ambiguous app, destructive action) is missing, choose tool='ask_user'.\n"
+                "5. After launching an unfamiliar app, call tool='inspect_ui' before calling 'click_ui'.\n"
+                "6. When the user states a preference or correction, call tool='save_memory'.\n"
+                "7. Only choose tool='done' after all requested actions succeed or when answering directly.\n\n"
+                f"Windows Bridge Online: {self.bridge_online}\n"
                 f"Installed Apps ({len(apps)} total, sample): {apps[:90]}\n"
                 f"Recalled Memories: {recalled_mem}\n"
                 f"Saved Skills: {recalled_skills}\n"
@@ -118,10 +128,9 @@ class AegisAgent:
             if not is_valid:
                 answer = input(f"\n[AegisCore Verification] {note}\nYou: ").strip()
                 user_input = f"{user_input} | User clarification: {answer}"
-                apps = self._get_installed_apps(force_refresh=True)
+                apps = self.get_installed_apps(force_refresh=True)
                 continue
 
-            # Execute verified tool
             if step.tool == "launch_app":
                 obs = self._call_bridge("/launch", "POST", {"app_name": step.app_name})
             elif step.tool == "inspect_ui":

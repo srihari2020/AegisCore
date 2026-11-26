@@ -19,7 +19,9 @@ def main():
     agent = AegisAgent(model_name=model)
     print(f"Warming up {model} in GPU VRAM...")
     agent.warmup()
-    print(f"AegisCore Online | Model: {model} | Bridge: {agent.bridge}")
+    apps = agent.get_installed_apps(force_refresh=True)
+    bridge_status = f"ONLINE ({len(apps)} Windows apps indexed)" if agent.bridge_online else "OFFLINE (Windows apps unavailable until win_host_server.py runs)"
+    print(f"AegisCore Online | Model: {model} | Bridge: {agent.bridge} [{bridge_status}]")
     print("Type a command (or 'exit' to quit):\n")
 
     while True:
