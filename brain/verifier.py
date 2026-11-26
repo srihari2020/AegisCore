@@ -1,0 +1,38 @@
+import difflib
+from brain.schema import ToolStep
+
+def verify_step(step: ToolStep, installed_apps: list[str], observations: list[str]) -> tuple[bool, str, ToolStep]:
+    """
+    Validates a model-proposed step against real OS state before execution.
+    Returns (is_valid, reason_or_override_question, step).
+    """
+    if step.tool == "launch_app":
+        query = step.app_name.strip().lower()
+        if not query:
+            return False, "Which application would you like me to open?", step
+        if installed_apps and query not in installed_apps:
+            partial = [a for a in installed_apps if query in a or a in query]
+            if partial:
+                step.app_name = partial[0]
+                return True, f"Matched installed app '{partial[0]}'", step
+            close = difflib.get_close_matches(query, installed_apps, n=3, cutoff=0.6)
+            suggestion = f" Closest installed matches: {close}." if close else ""
+            return False, f"'{step.app_name}' was not found in your installed apps.{suggestion} Should I search and download it or open another app?", step
+
+    elif step.tool == "download_item":
+        if not step.save_dir.strip():
+            return False, "Where should I save this download? (Once you tell me, I'll remember it for next time.)", step
+        if not step.url_or_query.strip():
+            return False, "Which exact link or search result should I download?", step
+
+    elif step.tool == "click_ui":
+        if not step.control_name.strip():
+            return False, "Which button or menu item should I click inside the active window?", step
+
+    elif step.tool == "file_ops":
+        if step.file_action not in {"find", "move"}:
+            return False, "Only 'find' and 'move' are permitted automatically. Do you want me to proceed?", step
+        if not step.source.strip():
+            return False, "Which file or folder path should I operate on?", step
+
+    return True, "verified", step

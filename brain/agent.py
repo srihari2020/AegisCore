@@ -1,14 +1,16 @@
 import os
+import time
 import subprocess
 import httpx
 from ollama import chat
 from memory.store import AegisMemory
 from hands.browser import BrowserHands
+from brain.schema import AgentStepPlan
+from brain.verifier import verify_step
 
 def get_win_bridge_url() -> str:
     if os.environ.get("AEGIS_WIN_BRIDGE"):
         return os.environ["AEGIS_WIN_BRIDGE"]
-    # Auto-detect WSL2 Windows host IP if localhost forwarding isn't active
     try:
         route = subprocess.check_output(["ip", "route", "show", "default"]).decode()
         host_ip = route.split()[2]
@@ -16,138 +18,28 @@ def get_win_bridge_url() -> str:
     except Exception:
         return "http://127.0.0.1:8765"
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_user",
-            "description": "Ask the user a clarifying question when details are missing, ambiguous, or destructive.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["question", "reason"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "launch_app",
-            "description": "Launch an installed desktop application by name.",
-            "parameters": {
-                "type": "object",
-                "properties": {"app_name": {"type": "string"}},
-                "required": ["app_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "inspect_ui",
-            "description": "Inspect live UI controls inside an open window.",
-            "parameters": {
-                "type": "object",
-                "properties": {"window_title": {"type": "string"}},
-                "required": ["window_title"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "click_ui",
-            "description": "Click a named button or menu inside an open window.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "window_title": {"type": "string"},
-                    "control_name": {"type": "string"},
-                },
-                "required": ["window_title", "control_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_tab",
-            "description": "Open, search, or close browser tabs.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["open", "search", "close"]},
-                    "url_or_query": {"type": "string"},
-                },
-                "required": ["action", "url_or_query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "download_item",
-            "description": "Download a file or paper to a specific directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "save_dir": {"type": "string"},
-                    "filename": {"type": "string"},
-                },
-                "required": ["url", "save_dir"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_memory",
-            "description": "Persist a user preference, rule, or correction into long-term memory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string"},
-                    "fact": {"type": "string"},
-                },
-                "required": ["category", "fact"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_skill",
-            "description": "Save a verified multi-step workflow into the reusable skill library.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name": {"type": "string"},
-                    "trigger_phrase": {"type": "string"},
-                    "steps": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["skill_name", "trigger_phrase", "steps"],
-            },
-        },
-    },
-]
-
 class AegisAgent:
-    def __init__(self, model_name: str = "qwen2.5:3b"):
+    def __init__(self, model_name: str = "aegiscore"):
         self.model = model_name
         self.mem = AegisMemory()
         self.browser = BrowserHands()
         self.bridge = get_win_bridge_url()
+        self._apps_cache: list[str] = []
+        self._apps_cache_ts: float = 0.0
+        self._schema = AgentStepPlan.model_json_schema()
 
-    def _get_installed_apps(self) -> list[str]:
+    def _get_installed_apps(self, force_refresh: bool = False) -> list[str]:
+        now = time.time()
+        if not force_refresh and self._apps_cache and (now - self._apps_cache_ts) < 30.0:
+            return self._apps_cache
         try:
-            r = httpx.get(f"{self.bridge}/apps", timeout=2.0)
-            return list(r.json().get("apps", {}).keys())[:80]
+            r = httpx.get(f"{self.bridge}/apps", timeout=1.5)
+            apps = sorted(r.json().get("apps", {}).keys())
+            self._apps_cache = apps
+            self._apps_cache_ts = now
+            return apps
         except Exception:
-            return ["chromium", "terminal", "vscode"]
+            return self._apps_cache or ["chromium", "terminal", "vscode"]
 
     def _call_bridge(self, endpoint: str, method: str = "POST", payload: dict | None = None) -> str:
         try:
@@ -157,58 +49,113 @@ class AegisAgent:
                 r = httpx.post(f"{self.bridge}{endpoint}", json=payload, timeout=5.0)
             return str(r.json())
         except Exception as e:
-            return f"Windows bridge unreachable at {self.bridge} ({e}). Start win_host_server.py on Windows."
+            return f"BRIDGE_OFFLINE: {self.bridge} ({e})"
 
-    def run_turn(self, user_input: str) -> str:
+    def warmup(self):
+        """Pins the model in GPU VRAM immediately so the first command has zero cold-start lag."""
+        try:
+            chat(
+                model=self.model,
+                messages=[{"role": "user", "content": "ping"}],
+                keep_alive="-1",
+                options={"num_predict": 1, "num_ctx": 4096},
+            )
+        except Exception:
+            pass
+
+    def run_turn(self, user_input: str, max_steps: int = 6) -> str:
         apps = self._get_installed_apps()
         recalled_mem = self.mem.recall_memories(user_input)
         recalled_skills = self.mem.recall_skills(user_input)
+        observations: list[str] = []
 
-        sys_prompt = (
-            "You are AegisCore, a local-first autonomous PC assistant. "
-            "Convert user commands into structured tool calls using live OS context, recalled memories, and saved skills. "
-            "Never guess missing details or run destructive actions without calling `ask_user` first.\n"
-            f"Installed Apps: {apps}\n"
-            f"Recalled Memories: {recalled_mem}\n"
-            f"Saved Skills: {recalled_skills}"
-        )
+        for step_idx in range(max_steps):
+            sys_prompt = (
+                "You are AegisCore, a zero-hallucination local PC automation agent.\n"
+                "Return valid JSON matching the AgentStepPlan schema.\n"
+                "STRICT RULES:\n"
+                "1. Never invent app names, file paths, or UI controls not present in Context or Observations.\n"
+                "2. If required information (folder path, target recipient, ambiguous app, destructive action) is missing, choose tool='ask_user'.\n"
+                "3. After launching an unfamiliar app, call tool='inspect_ui' before calling 'click_ui'.\n"
+                "4. When the user states a preference or correction, call tool='save_memory'.\n"
+                "5. Only choose tool='done' after all requested actions succeed or when answering a pure question.\n\n"
+                f"Installed Apps ({len(apps)} total, sample): {apps[:90]}\n"
+                f"Recalled Memories: {recalled_mem}\n"
+                f"Saved Skills: {recalled_skills}\n"
+                f"Execution Observations So Far: {observations}"
+            )
 
-        resp = chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_input},
-            ],
-            tools=TOOLS,
-        )
+            resp = chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_input},
+                ],
+                format=self._schema,
+                keep_alive="-1",
+                options={
+                    "temperature": 0,
+                    "top_p": 0.9,
+                    "num_ctx": 4096,
+                    "num_predict": 256,
+                },
+            )
 
-        calls = resp.message.tool_calls or []
-        if not calls:
-            return resp.message.content or "Done."
+            plan = AgentStepPlan.model_validate_json(resp.message.content)
+            step = plan.step
 
-        logs = []
-        for call in calls:
-            fn = call.function.name
-            args = call.function.arguments
+            if step.tool == "done":
+                return step.final_answer or ("\n".join(observations) if observations else "Completed.")
 
-            if fn == "ask_user":
-                answer = input(f"\n[AegisCore Clarification] {args['question']}\nYou: ")
-                return self.run_turn(f"{user_input} | User Clarification: {answer}")
-            elif fn == "launch_app":
-                logs.append(self._call_bridge("/launch", "POST", args))
-            elif fn == "inspect_ui":
-                logs.append(self._call_bridge("/ui_tree", "GET", args))
-            elif fn == "click_ui":
-                logs.append(self._call_bridge("/click_control", "POST", args))
-            elif fn == "browser_tab":
-                logs.append(self.browser.tab_action(args["action"], args["url_or_query"]))
-            elif fn == "download_item":
-                logs.append(self.browser.download_item(args["url"], args["save_dir"], args.get("filename", "auto")))
-            elif fn == "save_memory":
-                self.mem.add_memory(args["fact"], args.get("category", "preference"))
-                logs.append(f"Memorized: {args['fact']}")
-            elif fn == "save_skill":
-                self.mem.save_skill(args["skill_name"], args["trigger_phrase"], args["steps"])
-                logs.append(f"Saved skill '{args['skill_name']}'")
+            if step.tool == "ask_user":
+                answer = input(f"\n[AegisCore] {step.question}\nYou: ").strip()
+                user_input = f"{user_input} | User answered: {answer}"
+                recalled_mem = self.mem.recall_memories(user_input)
+                continue
 
-        return "\n".join(logs)
+            is_valid, note, step = verify_step(step, apps, observations)
+            if not is_valid:
+                answer = input(f"\n[AegisCore Verification] {note}\nYou: ").strip()
+                user_input = f"{user_input} | User clarification: {answer}"
+                apps = self._get_installed_apps(force_refresh=True)
+                continue
+
+            # Execute verified tool
+            if step.tool == "launch_app":
+                obs = self._call_bridge("/launch", "POST", {"app_name": step.app_name})
+            elif step.tool == "inspect_ui":
+                obs = self._call_bridge("/ui_tree", "GET", {"window_title": step.window_title})
+            elif step.tool == "click_ui":
+                obs = self._call_bridge("/click_control", "POST", {
+                    "window_title": step.window_title,
+                    "control_name": step.control_name,
+                })
+            elif step.tool == "type_or_hotkey":
+                obs = self._call_bridge("/type_or_hotkey", "POST", {
+                    "text": step.text,
+                    "keys": step.keys,
+                    "press_enter": step.press_enter,
+                })
+            elif step.tool == "browser_tab":
+                obs = self.browser.tab_action(step.browser_action or "open", step.url_or_query)
+            elif step.tool == "download_item":
+                obs = self.browser.download_item(step.url_or_query, step.save_dir, step.filename)
+            elif step.tool == "file_ops":
+                obs = self._call_bridge("/file_ops", "POST", {
+                    "action": step.file_action,
+                    "source": step.source,
+                    "dest": step.dest,
+                })
+            elif step.tool == "save_memory":
+                saved = self.mem.add_memory(step.fact, step.category)
+                recalled_mem = self.mem.recall_memories(user_input)
+                obs = f"MEMORIZED: {saved}"
+            elif step.tool == "save_skill":
+                saved = self.mem.save_skill(step.skill_name, step.trigger_phrase, step.steps)
+                obs = f"SKILL_SAVED: {saved}"
+            else:
+                obs = f"UNHANDLED_TOOL: {step.tool}"
+
+            observations.append(f"Step {step_idx + 1} [{step.tool}]: {obs}")
+
+        return "\n".join(observations)

@@ -1,19 +1,16 @@
 import json
+import subprocess
 from pathlib import Path
 from datasets import Dataset
 from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
-from trl import SFTTrainer
-from transformers import TrainingArguments
+from unsloth.chat_templates import get_chat_template, train_on_responses_only
+from trl import SFTTrainer, SFTConfig
 
 MODEL_NAME = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
 MAX_SEQ_LENGTH = 2048
 
 def load_jsonl(path: str) -> Dataset:
-    rows = []
-    with Path(path).open("r", encoding="utf-8") as f:
-        for line in f:
-            rows.append(json.loads(line))
+    rows = [json.loads(line) for line in Path(path).open("r", encoding="utf-8") if line.strip()]
     return Dataset.from_list(rows)
 
 def main():
@@ -28,7 +25,7 @@ def main():
         model,
         r=16,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=16,
+        lora_alpha=32,
         lora_dropout=0,
         bias="none",
         use_gradient_checkpointing="unsloth",
@@ -36,7 +33,6 @@ def main():
     )
 
     tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
-
     raw_ds = load_jsonl("dataset/aegiscore_train.jsonl")
 
     def format_prompts(examples):
@@ -52,12 +48,11 @@ def main():
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_ds,
-        dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
-        dataset_num_proc=2,
-        args=TrainingArguments(
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=4,
+        args=SFTConfig(
+            dataset_text_field="text",
+            max_length=MAX_SEQ_LENGTH,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=2,
             warmup_steps=15,
             num_train_epochs=2,
             learning_rate=2e-4,
@@ -73,13 +68,37 @@ def main():
         ),
     )
 
+    # Mask system/user tokens so loss trains strictly on valid JSON assistant plans
+    trainer = train_on_responses_only(
+        trainer,
+        instruction_part="<|im_start|>user\n",
+        response_part="<|im_start|>assistant\n",
+    )
+
     trainer.train()
 
-    # Save LoRA adapter and export quantized GGUF for Ollama
+    gguf_dir = Path("models/aegiscore-3b-gguf")
     model.save_pretrained("lora_adapters/aegiscore-3b")
     tokenizer.save_pretrained("lora_adapters/aegiscore-3b")
-    model.save_pretrained_gguf("models/aegiscore-3b-gguf", tokenizer, quantization_method="q4_k_m")
-    print("Training complete! GGUF exported to models/aegiscore-3b-gguf")
+    model.save_pretrained_gguf(str(gguf_dir), tokenizer, quantization_method="q4_k_m")
+
+    gguf_files = list(gguf_dir.glob("*.gguf"))
+    if gguf_files:
+        gguf_path = gguf_files[0].resolve()
+        modelfile = Path("Modelfile")
+        modelfile.write_text(
+            f'FROM {gguf_path}\n'
+            'TEMPLATE """{{- if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{- end }}'
+            '{{- range .Messages }}<|im_start|>{{ .Role }}\n{{ .Content }}<|im_end|>\n{{- end }}'
+            '<|im_start|>assistant\n"""\n'
+            'PARAMETER stop "<|im_start|>"\n'
+            'PARAMETER stop "<|im_end|>"\n'
+            'PARAMETER temperature 0\n'
+            'PARAMETER num_ctx 4096\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["ollama", "create", "aegiscore", "-f", "Modelfile"], check=True)
+        print("Registered fine-tuned 'aegiscore' model in Ollama!")
 
 if __name__ == "__main__":
     main()

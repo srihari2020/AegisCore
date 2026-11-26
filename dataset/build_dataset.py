@@ -2,10 +2,15 @@ import json
 import random
 from pathlib import Path
 
-SYSTEM_BASE = (
-    "You are AegisCore, a local-first autonomous PC assistant. "
-    "Convert user commands into structured tool calls using live OS context, recalled memories, and saved skills. "
-    "Never guess missing details or run destructive actions without calling `ask_user` first."
+SYSTEM_PROMPT = (
+    "You are AegisCore, a zero-hallucination local PC automation agent.\n"
+    "Return valid JSON matching the AgentStepPlan schema.\n"
+    "STRICT RULES:\n"
+    "1. Never invent app names, file paths, or UI controls not present in Context or Observations.\n"
+    "2. If required information (folder path, target recipient, ambiguous app, destructive action) is missing, choose tool='ask_user'.\n"
+    "3. After launching an unfamiliar app, call tool='inspect_ui' before calling 'click_ui'.\n"
+    "4. When the user states a preference or correction, call tool='save_memory'.\n"
+    "5. Only choose tool='done' after all requested actions succeed or when answering a pure question."
 )
 
 APPS_POOL = [
@@ -20,15 +25,14 @@ SITES = [
     ("Hugging Face", "https://huggingface.co"),
     ("arXiv", "https://arxiv.org"),
     ("Reddit", "https://reddit.com"),
-    ("Google Scholar", "https://scholar.google.com"),
 ]
 
 TOPICS = [
-    "QLoRA fine-tuning", "llama.cpp GGUF quantization", "ESP32 servo control",
-    "FastAPI async streaming", "ChromaDB metadata filtering", "PyTorch CUDA memory optimization"
+    "QLoRA quantization", "llama.cpp GGUF", "ESP32 PCA9685 servo",
+    "FastAPI async", "ChromaDB embeddings", "PyTorch CUDA"
 ]
 
-DOWNLOAD_DIRS = [
+FOLDERS = [
     ("research papers", r"D:\Documents\Papers"),
     ("datasets", r"D:\AI\Datasets"),
     ("videos", r"D:\Media\Clips"),
@@ -36,188 +40,165 @@ DOWNLOAD_DIRS = [
     ("invoices", r"D:\Finance\Invoices"),
 ]
 
-UI_WORKFLOWS = [
+WORKFLOWS = [
     ("handbrake", "HandBrake", ["Open Source", "Start Encode"], "compress_video", "compress video in HandBrake"),
     ("audacity", "Audacity", ["File", "Export Audio"], "export_mp3", "export audio as MP3 in Audacity"),
-    ("obs64", "OBS Studio", ["Start Recording", "Stop Recording"], "obs_quick_record", "start recording screen in OBS"),
-    ("blender", "Blender", ["Render", "Render Image"], "blender_render_frame", "render current frame in Blender"),
+    ("obs64", "OBS Studio", ["Start Recording", "Stop Recording"], "obs_record", "start recording in OBS"),
+    ("blender", "Blender", ["Render", "Render Image"], "blender_render", "render frame in Blender"),
 ]
 
-def make_sample(system_ctx: str, turns: list[dict]) -> dict:
-    return {"messages": [{"role": "system", "content": f"{SYSTEM_BASE}\n{system_ctx}"}] + turns}
+def plan_json(grounding_check: str, **step_kwargs) -> str:
+    step = {
+        "tool": "done",
+        "app_name": "",
+        "window_title": "",
+        "control_name": "",
+        "text": "",
+        "keys": [],
+        "press_enter": False,
+        "browser_action": "",
+        "url_or_query": "",
+        "save_dir": "",
+        "filename": "auto",
+        "file_action": "",
+        "source": "",
+        "dest": "",
+        "category": "preference",
+        "fact": "",
+        "skill_name": "",
+        "trigger_phrase": "",
+        "steps": [],
+        "question": "",
+        "final_answer": "",
+    }
+    step.update(step_kwargs)
+    return json.dumps({"grounding_check": grounding_check, "step": step}, ensure_ascii=False)
 
-def generate_dataset(count: int = 400) -> list[dict]:
+def generate(n: int = 800) -> list[dict]:
     rng = random.Random(42)
-    records = []
+    rows = []
 
-    for i in range(count):
-        mode = i % 7
+    for i in range(n):
+        case = i % 8
         apps = rng.sample(APPS_POOL, 6)
 
-        if mode == 0:
-            # Tab opening + search + download routed via recalled memory
-            site_name, url = rng.choice(SITES)
+        if case == 0:
+            # 1. Open tab + search
+            site, url = rng.choice(SITES)
             topic = rng.choice(TOPICS)
-            label, folder = rng.choice(DOWNLOAD_DIRS)
-            ctx = f"Installed Apps: {apps}\nRecalled Memories: ['Save {label} to {folder}']\nSaved Skills: []"
-            records.append(make_sample(ctx, [
-                {"role": "user", "content": f"Open {site_name}, search for {topic}, and download the top result."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {"function": {"name": "browser_tab", "arguments": {"action": "open", "url_or_query": url}}},
-                        {"function": {"name": "browser_tab", "arguments": {"action": "search", "url_or_query": topic}}},
-                        {"function": {"name": "download_item", "arguments": {"url": "top_search_result", "save_dir": folder, "filename": "auto"}}},
-                    ],
-                },
-            ]))
+            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []\nExecution Observations So Far: []"
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": f"Open {site} in a new tab and search for {topic}."},
+                {"role": "assistant", "content": plan_json(
+                    f"Action is browser_tab open on {url}.",
+                    tool="browser_tab", browser_action="open", url_or_query=url
+                )},
+            ]})
 
-        elif mode == 1:
-            # Newly installed app discovery & UI tree inspection
-            app_slug, win_title, controls, _, _ = rng.choice(UI_WORKFLOWS)
-            if app_slug not in apps:
-                apps.append(app_slug)
-            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []"
-            records.append(make_sample(ctx, [
-                {"role": "user", "content": f"I just downloaded {win_title}. Launch it and check what buttons are inside."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {"function": {"name": "launch_app", "arguments": {"app_name": app_slug}}},
-                        {"function": {"name": "inspect_ui", "arguments": {"window_title": win_title}}},
-                    ],
-                },
-            ]))
+        elif case == 1:
+            # 2. Download with recalled memory path
+            label, folder = rng.choice(FOLDERS)
+            topic = rng.choice(TOPICS)
+            ctx = f"Installed Apps: {apps}\nRecalled Memories: ['Save {label} to {folder}']\nSaved Skills: []\nExecution Observations So Far: ['Step 1 [browser_tab]: Opened tab']"
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": f"Download the {label} about {topic} from this tab."},
+                {"role": "assistant", "content": plan_json(
+                    f"Recalled memory specifies save_dir='{folder}' for {label}.",
+                    tool="download_item", url_or_query="active_tab_download", save_dir=folder, filename="auto"
+                )},
+            ]})
 
-        elif mode == 2:
-            # In-app UI clicking + saving workflow as a reusable skill
-            app_slug, win_title, controls, skill_name, trigger = rng.choice(UI_WORKFLOWS)
-            ui_desc = [f"Button('{c}')" for c in controls]
-            ctx = f"Active Window: {win_title} | UI Controls: {ui_desc}\nRecalled Memories: []\nSaved Skills: []"
-            records.append(make_sample(ctx, [
-                {"role": "user", "content": f"Click {controls[0]} then {controls[1]}, and save this workflow as '{skill_name}'."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {"function": {"name": "click_ui", "arguments": {"window_title": win_title, "control_name": controls[0]}}},
-                        {"function": {"name": "click_ui", "arguments": {"window_title": win_title, "control_name": controls[1]}}},
-                        {
-                            "function": {
-                                "name": "save_skill",
-                                "arguments": {
-                                    "skill_name": skill_name,
-                                    "trigger_phrase": trigger,
-                                    "steps": [f"launch_app:{app_slug}"] + [f"click_ui:{c}" for c in controls],
-                                },
-                            }
-                        },
-                    ],
-                },
-            ]))
+        elif case == 2:
+            # 3. Missing download path -> anti-hallucination ask_user
+            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []\nExecution Observations So Far: []"
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": "Download this dataset file for me."},
+                {"role": "assistant", "content": plan_json(
+                    "MISSING_INFO: No target folder found in Recalled Memories or prompt.",
+                    tool="ask_user",
+                    question="Which folder should I save this dataset into? Once you tell me, I will remember it for future datasets."
+                )},
+            ]})
 
-        elif mode == 3:
-            # Multi-turn ambiguity clarification -> memory persistence
-            ctx = f"Installed Apps: ['chrome', 'telegram', 'whatsapp']\nRecalled Memories: ['Contact: Phani (WhatsApp)', 'Contact: Phani Kumar (Telegram)']\nSaved Skills: []"
-            records.append(make_sample(ctx, [
-                {"role": "user", "content": "Download the latest build archive and send it to Phani."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": "ask_user",
-                                "arguments": {
-                                    "question": "Should I send the build archive to Phani on WhatsApp or Phani Kumar on Telegram?",
-                                    "reason": "ambiguous_recipient",
-                                },
-                            }
-                        }
-                    ],
-                },
-                {"role": "user", "content": "Always send project builds to Phani on Telegram by default."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": "save_memory",
-                                "arguments": {
-                                    "category": "preference",
-                                    "fact": "Send project builds to Phani Kumar on Telegram by default.",
-                                },
-                            }
-                        },
-                        {"function": {"name": "launch_app", "arguments": {"app_name": "telegram"}}},
-                    ],
-                },
-            ]))
+        elif case == 3:
+            # 4. Uninstalled app -> anti-hallucination refusal/clarification
+            ctx = f"Installed Apps: ['chrome', 'vlc', 'vscode']\nRecalled Memories: []\nSaved Skills: []\nExecution Observations So Far: []"
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": "Open DaVinci Resolve and start a project."},
+                {"role": "assistant", "content": plan_json(
+                    "MISSING_INFO: 'davinci resolve' is not present in Installed Apps.",
+                    tool="ask_user",
+                    question="DaVinci Resolve is not in your installed apps list. Would you like me to search and download its installer first?"
+                )},
+            ]})
 
-        elif mode == 4:
-            # User correction -> immediate memory update
-            label, folder = rng.choice(DOWNLOAD_DIRS)
-            ctx = f"Installed Apps: {apps}\nRecalled Memories: ['Save {label} to C:\\Temp']\nSaved Skills: []"
-            records.append(make_sample(ctx, [
-                {"role": "user", "content": f"Stop saving {label} to C:\\Temp. Remember to always put them in {folder}."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": "save_memory",
-                                "arguments": {
-                                    "category": "rule",
-                                    "fact": f"Always save {label} to {folder}.",
-                                },
-                            }
-                        }
-                    ],
-                },
-            ]))
+        elif case == 4:
+            # 5. Newly installed app -> launch then inspect_ui
+            slug, title, ctrls, _, _ = rng.choice(WORKFLOWS)
+            if slug not in apps:
+                apps.append(slug)
+            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []\nExecution Observations So Far: ['Step 1 [launch_app]: launched {slug}']"
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": f"I just installed {title}. Open it and use it to process my file."},
+                {"role": "assistant", "content": plan_json(
+                    f"{title} launched; inspecting UI tree before clicking any controls.",
+                    tool="inspect_ui", window_title=title
+                )},
+            ]})
 
-        elif mode == 5:
-            # Destructive file operation -> safety confirmation gate
-            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []"
-            records.append(make_sample(ctx, [
-                {"role": "user", "content": "Delete all old .exe and .zip files inside my Downloads folder permanently."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": "ask_user",
-                                "arguments": {
-                                    "question": "Permanent deletion cannot be undone. Would you like me to move those installers and archives to the Recycle Bin instead, or confirm permanent delete?",
-                                    "reason": "destructive_file_action",
-                                },
-                            }
-                        }
-                    ],
-                },
-            ]))
+        elif case == 5:
+            # 6. Click observed UI control + save skill
+            slug, title, ctrls, skill_name, trigger = rng.choice(WORKFLOWS)
+            ctx = (
+                f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []\n"
+                f"Execution Observations So Far: ['Step 1 [inspect_ui]: {{\"window\": \"{title}\", \"elements\": [{{\"type\": \"Button\", \"name\": \"{ctrls[0]}\"}}, {{\"type\": \"Button\", \"name\": \"{ctrls[1]}\"}}]}}']"
+            )
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": f"Click {ctrls[1]} and save this workflow as {skill_name}."},
+                {"role": "assistant", "content": plan_json(
+                    f"Control '{ctrls[1]}' verified in inspect_ui output.",
+                    tool="click_ui", window_title=title, control_name=ctrls[1]
+                )},
+            ]})
+
+        elif case == 6:
+            # 7. Save user preference / correction
+            label, folder = rng.choice(FOLDERS)
+            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []\nExecution Observations So Far: []"
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": f"Remember that whenever I download {label}, always save them to {folder}."},
+                {"role": "assistant", "content": plan_json(
+                    f"User explicitly stated a persistent storage rule for {label}.",
+                    tool="save_memory", category="rule", fact=f"Always save {label} to {folder}."
+                )},
+            ]})
 
         else:
-            # Replaying a previously learned skill
-            app_slug, win_title, controls, skill_name, trigger = rng.choice(UI_WORKFLOWS)
-            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: ['{skill_name}: {trigger}']"
-            records.append(make_sample(ctx, [
-                {"role": "user", "content": f"Run my workflow to {trigger}."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {"function": {"name": "launch_app", "arguments": {"app_name": app_slug}}},
-                        {"function": {"name": "click_ui", "arguments": {"window_title": win_title, "control_name": controls[0]}}},
-                        {"function": {"name": "click_ui", "arguments": {"window_title": win_title, "control_name": controls[1]}}},
-                    ],
-                },
-            ]))
+            # 8. Completion & grounded final answer after tool execution
+            site, url = rng.choice(SITES)
+            ctx = f"Installed Apps: {apps}\nRecalled Memories: []\nSaved Skills: []\nExecution Observations So Far: ['Step 1 [browser_tab]: Opened tab 1: {site}']"
+            rows.append({"messages": [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{ctx}"},
+                {"role": "user", "content": f"Open {site}."},
+                {"role": "assistant", "content": plan_json(
+                    f"Observation confirms {site} tab is already open.",
+                    tool="done", final_answer=f"Opened {site} ({url}) in a new browser tab."
+                )},
+            ]})
 
-    return records
+    return rows
 
 if __name__ == "__main__":
-    data = generate_dataset(420)
+    dataset = generate(800)
     out = Path("dataset/aegiscore_train.jsonl")
-    out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:
-        for row in data:
+        for row in dataset:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"Generated {len(data)} multi-scenario training records at {out}")
+    print(f"Generated {len(dataset)} schema-aligned training records at {out}")

@@ -1,9 +1,24 @@
 import os
+import ollama
 from brain.agent import AegisAgent
 
+def resolve_model() -> str:
+    if os.environ.get("AEGIS_MODEL"):
+        return os.environ["AEGIS_MODEL"]
+    try:
+        models = [m.model for m in ollama.list().models]
+        for candidate in ("aegiscore:latest", "aegiscore", "qwen2.5:3b"):
+            if candidate in models:
+                return candidate
+    except Exception:
+        pass
+    return "qwen2.5:3b"
+
 def main():
-    model = os.environ.get("AEGIS_MODEL", "qwen2.5:3b")
+    model = resolve_model()
     agent = AegisAgent(model_name=model)
+    print(f"Warming up {model} in GPU VRAM...")
+    agent.warmup()
     print(f"AegisCore Online | Model: {model} | Bridge: {agent.bridge}")
     print("Type a command (or 'exit' to quit):\n")
 
