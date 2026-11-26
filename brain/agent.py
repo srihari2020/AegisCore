@@ -142,7 +142,19 @@ class AegisAgent:
                 apps = self.get_installed_apps(force_refresh=True)
                 continue
 
-            # Execute verified tool
+            # Execute verified tool with crash-proof observation capture
+            try:
+                obs = self._execute_tool(plan, user_input)
+                if plan.tool == "save_memory":
+                    recalled_mem = self.mem.recall_memories(user_input)
+            except Exception as e:
+                obs = f"TOOL_ERROR [{plan.tool}]: {e}"
+
+            observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
+
+        return "\n".join(observations)
+
+    def _execute_tool(self, plan: AgentStepPlan, user_input: str) -> str:
             if plan.tool == "launch_app":
                 if self.bridge_online:
                     obs = self._call_bridge("/launch", "POST", {"app_name": plan.target})
@@ -182,7 +194,4 @@ class AegisAgent:
                 obs = f"SKILL_SAVED: {saved}"
             else:
                 obs = f"UNHANDLED_TOOL: {plan.tool}"
-
-            observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
-
-        return "\n".join(observations)
+            return obs
