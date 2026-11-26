@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -35,6 +36,26 @@ def health():
 @app.get("/apps")
 def scan_installed_apps():
     apps = {}
+
+    # 1. Microsoft Store / MSIX / UWP apps via Get-StartApps
+    try:
+        raw = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress"],
+            timeout=5.0,
+        ).decode("utf-8", errors="ignore").strip()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for item in parsed:
+                name = (item.get("Name") or "").strip().lower()
+                app_id = (item.get("AppID") or "").strip()
+                if name and app_id and "uninstall" not in name:
+                    apps[name] = f"uwp:{app_id}"
+    except Exception:
+        pass
+
+    # 2. Start Menu & Desktop .lnk shortcuts
     shortcut_dirs = [
         Path(os.environ.get("PROGRAMDATA", "")) / r"Microsoft\Windows\Start Menu\Programs",
         Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs",
@@ -46,6 +67,7 @@ def scan_installed_apps():
             for lnk in base.rglob("*.lnk"):
                 apps[lnk.stem.lower()] = str(lnk)
 
+    # 3. Registry App Paths
     reg_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
     for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
         try:
@@ -59,17 +81,6 @@ def scan_installed_apps():
         except OSError:
             continue
 
-    # Ensure common browsers/tools are indexed even if omitted from Start Menu
-    common_bins = {
-        "google chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        "brave": r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-        "msedge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    }
-    for name, path in common_bins.items():
-        if Path(path).exists() and name not in apps:
-            apps[name] = path
-
     return {"apps": apps}
 
 @app.post("/launch")
@@ -82,6 +93,12 @@ def launch_app(req: LaunchReq):
         if not matches:
             return {"status": "not_found", "available_sample": list(apps.keys())[:30]}
         target = apps[matches[0]]
+
+    if target.startswith("uwp:"):
+        app_id = target[4:]
+        subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+        return {"status": "launched_uwp", "target": app_id}
+
     subprocess.Popen(["cmd", "/c", "start", "", target], shell=True)
     return {"status": "launched", "target": target}
 

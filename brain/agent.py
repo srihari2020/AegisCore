@@ -33,7 +33,7 @@ class AegisAgent:
 
     def get_installed_apps(self, force_refresh: bool = False) -> list[str]:
         now = time.time()
-        if not force_refresh and self._apps_cache and (now - self._apps_cache_ts) < 30.0:
+        if not force_refresh and self._apps_cache and (now - self._apps_cache_ts) < 300.0:
             return self._apps_cache
 
         apps_set = set(self.wsl_win.scan_apps().keys())
