@@ -11,10 +11,13 @@ APP_ALIASES = {
 }
 
 def verify_step(plan: AgentStepPlan, installed_apps: list[str]) -> tuple[bool, str, AgentStepPlan]:
-    if plan.tool == "launch_app":
+    if plan.tool in {"launch_app", "in_app_search"}:
         query = plan.target.strip().lower()
         if not query:
             return False, "Which application would you like me to open?", plan
+
+        if plan.tool == "in_app_search" and not plan.value.strip():
+            return False, f"What contact or text should I search for inside {plan.target}?", plan
 
         if query in installed_apps:
             return True, "verified", plan

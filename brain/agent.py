@@ -93,14 +93,16 @@ class AegisAgent:
                 "Respond ONLY with JSON matching AgentStepPlan: {tool, target, value, extra, message}.\n"
                 "EXAMPLES:\n"
                 '- User: "hey" -> {"tool":"done","target":"","value":"","extra":"","message":"Hey! Ready when you are. What would you like me to do?"}\n'
-                '- User: "open google chrome" -> {"tool":"launch_app","target":"google chrome","value":"","extra":"","message":""}\n'
+                '- User: "open whatsapp" -> {"tool":"launch_app","target":"whatsapp","value":"","extra":"","message":""}\n'
+                '- User: "in whatsapp open message for gopi Niat friend" -> {"tool":"in_app_search","target":"whatsapp","value":"gopi Niat friend","extra":"open_first","message":""}\n'
                 '- User: "open youtube" -> {"tool":"browser_tab","target":"https://youtube.com","value":"","extra":"open","message":""}\n'
                 '- User: "save papers to D:\\Papers" -> {"tool":"save_memory","target":"rule","value":"Save research papers to D:\\Papers","extra":"","message":""}\n'
                 "RULES:\n"
-                "1. Always populate 'message' when tool='done' or tool='ask_user'. Never leave 'message' empty for those two tools.\n"
-                "2. Never invent app names, file paths, or UI controls not in Installed Apps, Memories, or Observations.\n"
-                "3. NEVER repeat an action already listed in Observations So Far—immediately call tool='done' once requested actions succeed.\n\n"
-                f"Installed Apps ({len(apps)}): {apps[:100]}\n"
+                "1. When the user says 'in <app> open chat/message for <name>' or 'search <text> in <app>', IMMEDIATELY call tool='in_app_search' with target=<app>, value=<name/text>, extra='open_first'. If Recalled Memories maps that nickname to a saved contact name, use the saved contact name.\n"
+                "2. Always populate 'message' when tool='done' or tool='ask_user'. Never leave 'message' empty for those two tools.\n"
+                "3. Never invent app names, file paths, or UI controls not in Installed Apps, Memories, or Observations.\n"
+                "4. NEVER repeat an action already listed in Observations So Far—immediately call tool='done' once requested actions succeed.\n\n"
+                f"Installed Apps ({len(apps)}): {apps[:110]}\n"
                 f"Recalled Memories: {recalled_mem}\n"
                 f"Saved Skills: {recalled_skills}\n"
                 f"Observations So Far: {observations}"
@@ -148,7 +150,6 @@ class AegisAgent:
                 apps = self.get_installed_apps(force_refresh=True)
                 continue
 
-            # Circuit breaker: block duplicate execution of an already-completed action
             sig = (
                 plan.tool,
                 plan.target.strip().lower(),
@@ -168,7 +169,6 @@ class AegisAgent:
             executed_signatures.add(sig)
             observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
 
-            # Fast single-intent exit: 1 LLM call, instant response, zero loop risk
             if not is_compound and not obs.startswith(("NOT_FOUND", "TOOL_ERROR", "BRIDGE_OFFLINE", "DOWNLOAD_PENDING")):
                 return self._format_observations(observations)
 
@@ -179,6 +179,9 @@ class AegisAgent:
             if self.bridge_online:
                 return self._call_bridge("/launch", "POST", {"app_name": plan.target})
             return self.wsl_win.launch(plan.target)
+        elif plan.tool == "in_app_search":
+            open_first = plan.extra.strip().lower() != "search_only"
+            return self.wsl_win.in_app_search(plan.target, plan.value, open_first=open_first)
         elif plan.tool == "inspect_ui":
             return self._call_bridge("/ui_tree", "GET", {"window_title": plan.target})
         elif plan.tool == "click_ui":

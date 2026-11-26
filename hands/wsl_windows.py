@@ -39,11 +39,8 @@ class WSLWindowsInterop:
 
     def scan_apps(self) -> dict[str, str]:
         apps: dict[str, str] = {}
-
-        # 1. Index all Windows Start Apps (covers Microsoft Store / UWP / MSIX apps like WhatsApp)
         apps.update(self._scan_uwp_start_apps())
 
-        # 2. Common Win32 executables on C:\
         known_bins = {
             "google chrome": Path("/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"),
             "chrome": Path("/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"),
@@ -56,7 +53,6 @@ class WSLWindowsInterop:
             if path.is_file():
                 apps[name] = str(path)
 
-        # 3. Windows Start Menu & Desktop .lnk shortcuts
         shortcut_roots = [
             Path("/mnt/c/ProgramData/Microsoft/Windows/Start Menu/Programs"),
         ]
@@ -115,3 +111,47 @@ class WSLWindowsInterop:
             stderr=subprocess.DEVNULL,
         )
         return f"LAUNCHED_VIA_WSL_INTEROP: {win_path}"
+
+    def in_app_search(self, app_name: str, search_query: str, open_first: bool = True) -> str:
+        """Brings app to foreground (launching if needed), runs Ctrl+F, pastes query, and opens top match."""
+        safe_title = app_name.strip().replace("'", "''")
+        safe_query = search_query.strip().replace("'", "''")
+        select_keys = "{DOWN}{ENTER}" if open_first else ""
+
+        # Ensure app is launched/brought forward first
+        self.launch(app_name)
+
+        ps_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$wshell = New-Object -ComObject WScript.Shell
+$activated = $false
+for ($i = 0; $i -lt 10; $i++) {{
+    $proc = Get-Process | Where-Object {{ $_.MainWindowTitle -like '*{safe_title}*' -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+    if ($proc -and $wshell.AppActivate($proc.Id)) {{
+        $activated = $true
+        break
+    }}
+    Start-Sleep -Milliseconds 300
+}}
+if (-not $activated) {{
+    $activated = $wshell.AppActivate('{safe_title}')
+}}
+Start-Sleep -Milliseconds 350
+Set-Clipboard -Value '{safe_query}'
+[System.Windows.Forms.SendKeys]::SendWait('^f')
+Start-Sleep -Milliseconds 250
+[System.Windows.Forms.SendKeys]::SendWait('^a^v')
+Start-Sleep -Milliseconds 650
+if ('{select_keys}' -ne '') {{
+    [System.Windows.Forms.SendKeys]::SendWait('{select_keys}')
+}}
+"""
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            cwd="/mnt/c",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10.0,
+        )
+        action_desc = "and opened top match" if open_first else "in search bar"
+        return f"IN_APP_SEARCH [{app_name}]: Searched '{search_query}' {action_desc}."

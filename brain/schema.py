@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 ToolName = Literal[
     "done",
     "launch_app",
+    "in_app_search",
     "browser_tab",
     "download_item",
     "inspect_ui",
@@ -23,11 +24,11 @@ class AgentStepPlan(BaseModel):
     )
     value: str = Field(
         default="",
-        description="UI control name, download save_dir, destination path, text/keys, memory fact, or skill trigger.",
+        description="Search query inside app, UI control name, download save_dir, destination path, text/keys, memory fact, or skill trigger.",
     )
     extra: str = Field(
         default="",
-        description="browser_tab action (open|search|close), file_ops action (find|move), filename, or skill steps.",
+        description="in_app_search mode (open_first|search_only), browser_tab action (open|search|close), file_ops action (find|move), filename, or skill steps.",
     )
     message: str = Field(
         default="",
