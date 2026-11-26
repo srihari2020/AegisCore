@@ -1,0 +1,24 @@
+# Environments & Cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local Vector DB, Logs & Runtime State
+jarvis_db/
+chroma_data/
+skills/learned/*.json
+logs/
+*.log
+.env
+
+# Model Weights, Checkpoints & GGUF Artifacts
+models/
+outputs/
+lora_adapters/
+*.gguf
+*.safetensors
+*.bin
+wandb/
