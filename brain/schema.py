@@ -3,15 +3,20 @@ from pydantic import BaseModel, Field
 
 ToolName = Literal[
     "done",
+    "see_screen",
+    "click_screen_target",
     "launch_app",
     "in_app_search",
     "send_message",
     "send_sticker",
     "browser_tab",
     "download_item",
+    "read_document",
+    "watch_video",
+    "mcp_call",
+    "write_content",
     "inspect_ui",
     "click_ui",
-    "type_or_hotkey",
     "file_ops",
     "save_memory",
     "save_skill",
@@ -22,17 +27,17 @@ class AgentStepPlan(BaseModel):
     tool: ToolName = Field(description="Whitelisted tool to execute, or 'done' to reply.")
     target: str = Field(
         default="",
-        description="App name, window title, URL/search query, source path, memory category, or skill name.",
+        description="App name, file/video path, URL/search query, MCP server name, output filename, or memory category.",
     )
     value: str = Field(
         default="",
-        description="Message text, sticker hint, search query, UI control name, save_dir, destination path, or memory fact.",
+        description="Visual goal, element_id, message text, search query, MCP tool name, content body, save_dir, or memory fact.",
     )
     extra: str = Field(
         default="",
-        description="Recipient contact name (for send_message/send_sticker), in_app_search mode, browser_tab action, file_ops action, or skill steps.",
+        description="Recipient contact, MCP JSON arguments, browser action (open|search|close), file action (find|move), or skill steps.",
     )
     message: str = Field(
         default="",
-        description="Required non-empty final response when tool='done', or non-empty clarifying question when tool='ask_user'.",
+        description="Required non-empty Jarvis response + proactive suggestions when tool='done', or clarifying question when tool='ask_user'.",
     )
