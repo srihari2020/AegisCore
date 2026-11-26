@@ -52,16 +52,16 @@ class AegisAgent:
             return f"BRIDGE_OFFLINE: {self.bridge} ({e})"
 
     def warmup(self):
-        """Pins the model in GPU VRAM immediately so the first command has zero cold-start lag."""
+        """Pins the model in GPU VRAM indefinitely so commands execute with zero cold-start lag."""
         try:
             chat(
                 model=self.model,
                 messages=[{"role": "user", "content": "ping"}],
-                keep_alive="-1",
+                keep_alive=-1,
                 options={"num_predict": 1, "num_ctx": 4096},
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Warning] Warmup skipped: {e}")
 
     def run_turn(self, user_input: str, max_steps: int = 6) -> str:
         apps = self._get_installed_apps()
@@ -74,11 +74,12 @@ class AegisAgent:
                 "You are AegisCore, a zero-hallucination local PC automation agent.\n"
                 "Return valid JSON matching the AgentStepPlan schema.\n"
                 "STRICT RULES:\n"
-                "1. Never invent app names, file paths, or UI controls not present in Context or Observations.\n"
-                "2. If required information (folder path, target recipient, ambiguous app, destructive action) is missing, choose tool='ask_user'.\n"
-                "3. After launching an unfamiliar app, call tool='inspect_ui' before calling 'click_ui'.\n"
-                "4. When the user states a preference or correction, call tool='save_memory'.\n"
-                "5. Only choose tool='done' after all requested actions succeed or when answering a pure question.\n\n"
+                "1. For greetings, chat, or general questions requiring no PC action, immediately set tool='done' and write a clear, concise response in final_answer.\n"
+                "2. Never invent app names, file paths, or UI controls not present in Context or Observations.\n"
+                "3. If required information (folder path, target recipient, ambiguous app, destructive action) is missing, choose tool='ask_user'.\n"
+                "4. After launching an unfamiliar app, call tool='inspect_ui' before calling 'click_ui'.\n"
+                "5. When the user states a preference or correction, call tool='save_memory'.\n"
+                "6. Only choose tool='done' after all requested actions succeed or when answering directly.\n\n"
                 f"Installed Apps ({len(apps)} total, sample): {apps[:90]}\n"
                 f"Recalled Memories: {recalled_mem}\n"
                 f"Saved Skills: {recalled_skills}\n"
@@ -92,7 +93,7 @@ class AegisAgent:
                     {"role": "user", "content": user_input},
                 ],
                 format=self._schema,
-                keep_alive="-1",
+                keep_alive=-1,
                 options={
                     "temperature": 0,
                     "top_p": 0.9,
