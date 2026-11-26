@@ -4,7 +4,7 @@ import re
 import subprocess
 from pathlib import Path
 
-WIN32_HELPER_CS = """
+WIN32_HELPER_CS = r"""
 using System;
 using System.Runtime.InteropServices;
 public class Win32Focus {
@@ -161,45 +161,55 @@ class WSLWindowsInterop:
         clean_query = self._clean_contact_query(search_query)
         self.launch(app_name)
 
-        ps_script = f"""
+        ps_template = r"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
-{WIN32_HELPER_CS}
+__WIN32_CS__
 '@
 
-$appTitle = {json.dumps(app_name.strip())}
-$query = {json.dumps(clean_query)}$openFirst = {'$true' if open_first else '$false'}
+$appTitle = __APP_TITLE__
+$query = __QUERY__
+$openFirst = __OPEN_FIRST__
 
 $hwnd = [IntPtr]::Zero
-for ($i = 0; $i -lt 15; $i++) {{
-    $proc = Get-Process \vert{} Where-Object {{$_.MainWindowTitle -like "*$appTitle*" -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-    if ($proc) {{ $hwnd =$proc.MainWindowHandle; break }}
+for ($i = 0; $i -lt 15; $i++) {
+    foreach ($p in (Get-Process)) {
+        if ($p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like "*$appTitle*") {
+            $hwnd = $p.MainWindowHandle
+            break
+        }
+    }
+    if ($hwnd -ne [IntPtr]::Zero) { break }
     Start-Sleep -Milliseconds 300
-}}
-if ($hwnd -eq [IntPtr]::Zero) {{ Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }}
+}
+if ($hwnd -eq [IntPtr]::Zero) { Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }
 
 [Win32Focus]::ForceForeground($hwnd)
 Start-Sleep -Milliseconds 350
 
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-$editCond = New-Object System.Windows.Automation.PropertyCondition( [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit )$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$editCond)
-$searchFocused =$false
-foreach ($el in$edits) {{
-    if ($el.Current.Name -match "Search|Find|chat") {{
-        $rect =$el.Current.BoundingRectangle
-        if ($rect.Width -gt 20 -and$rect.Height -gt 10) {{
-            [Win32Focus]::ClickAt([int]($rect.X +$rect.Width / 2), [int]($rect.Y +$rect.Height / 2))
-            $searchFocused =$true
+$editCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit
+)
+$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)
+$searchFocused = $false
+foreach ($el in $edits) {
+    if ($el.Current.Name -match "Search|Find|chat") {
+        $rect = $el.Current.BoundingRectangle
+        if ($rect.Width -gt 20 -and $rect.Height -gt 10) {
+            [Win32Focus]::ClickAt([int]($rect.X + $rect.Width / 2), [int]($rect.Y + $rect.Height / 2))
+            $searchFocused = $true
             break
-        }}
-    }}
-}}
-if (-not $searchFocused) {{
+        }
+    }
+}
+if (-not $searchFocused) {
     [System.Windows.Forms.SendKeys]::SendWait('^f')
     Start-Sleep -Milliseconds 250
-}}
+}
 
 Set-Clipboard -Value $query
 [System.Windows.Forms.SendKeys]::SendWait('^a')
@@ -207,31 +217,40 @@ Start-Sleep -Milliseconds 80
 [System.Windows.Forms.SendKeys]::SendWait('^v')
 Start-Sleep -Milliseconds 950
 
-if ($openFirst) {{$clickedName = ""
-    $all =$root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-    $firstToken = ($query -split '\\s+')[0]
-    foreach ($item in$all) {{
-        $ct =$item.Current.ControlType.ProgrammaticName
-        $nm =$item.Current.Name
-        if (($ct -eq "ControlType.ListItem" -or $ct -eq "ControlType.DataItem" -or $ct -eq "ControlType.Button") -and $nm -and ($nm -match [regex]::Escape($firstToken))) {{
-            $r =$item.Current.BoundingRectangle
-            if ($r.Width -gt 80 -and $r.Height -gt 28 -and$r.Y -gt 80) {{
-                [Win32Focus]::ClickAt([int]($r.X +$r.Width / 2), [int]($r.Y +$r.Height / 2))
-                $clickedName =$nm
+if ($openFirst) {
+    $clickedName = ""
+    $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    $tokens = $query -split '\s+'
+    $firstToken = $tokens[0]
+    foreach ($item in $all) {
+        $ct = $item.Current.ControlType.ProgrammaticName
+        $nm = $item.Current.Name
+        if (($ct -eq "ControlType.ListItem" -or $ct -eq "ControlType.DataItem" -or $ct -eq "ControlType.Button") -and $nm -and ($nm -match [regex]::Escape($firstToken))) {
+            $r = $item.Current.BoundingRectangle
+            if ($r.Width -gt 80 -and $r.Height -gt 28 -and $r.Y -gt 80) {
+                [Win32Focus]::ClickAt([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+                $clickedName = $nm
                 break
-            }}
-        }}
-    }}
-    if ($clickedName -ne "") {{
+            }
+        }
+    }
+    if ($clickedName -ne "") {
         Write-Output "OPENED_CHAT [$appTitle]: Searched '$query' and clicked '$clickedName'."
-    }} else {{
-        [System.Windows.Forms.SendKeys]::SendWait('{{DOWN}}{{ENTER}}')
+    } else {
+        [System.Windows.Forms.SendKeys]::SendWait('{DOWN}{ENTER}')
         Write-Output "SEARCHED_AND_SELECTED [$appTitle]: Searched '$query' (keyboard fallback)."
-    }}
-}} else {{
+    }
+} else {
     Write-Output "SEARCHED [$appTitle]: Typed '$query' in search bar."
-}}
+}
 """
+        ps_script = (
+            ps_template
+            .replace("__WIN32_CS__", WIN32_HELPER_CS)
+            .replace("__APP_TITLE__", json.dumps(app_name.strip()))
+            .replace("__QUERY__", json.dumps(clean_query))
+            .replace("__OPEN_FIRST__", "$true" if open_first else "$false")
+        )
         out = self._run_ps(ps_script)
         return out if out else f"IN_APP_SEARCH [{app_name}]: Executed search for '{clean_query}'."
 
@@ -240,44 +259,60 @@ if ($openFirst) {{$clickedName = ""
         if recipient.strip():
             prefix_log = self.in_app_search(app_name, recipient, open_first=True) + " | "
 
-        ps_script = f"""
+        ps_template = r"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
-{WIN32_HELPER_CS}
+__WIN32_CS__
 '@
 
-$appTitle = {json.dumps(app_name.strip())}$msg = {json.dumps(text)}
+$appTitle = __APP_TITLE__
+$msg = __MSG__
 
-$proc = Get-Process \vert{} Where-Object {{$_.MainWindowTitle -like "*$appTitle*" -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-if (-not $proc) {{ Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }}
-$hwnd =$proc.MainWindowHandle
+$hwnd = [IntPtr]::Zero
+foreach ($p in (Get-Process)) {
+    if ($p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like "*$appTitle*") {
+        $hwnd = $p.MainWindowHandle
+        break
+    }
+}
+if ($hwnd -eq [IntPtr]::Zero) { Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }
 [Win32Focus]::ForceForeground($hwnd)
 Start-Sleep -Milliseconds 300
 
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-$editCond = New-Object System.Windows.Automation.PropertyCondition( [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit )$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$editCond)
-$focused =$false
-foreach ($el in$edits) {{
-    $nm =$el.Current.Name
-    if ($nm -match "Type a message|Write a message|Message") {{
-        $r =$el.Current.BoundingRectangle
-        if ($r.Width -gt 50 -and$r.Height -gt 12) {{
-            [Win32Focus]::ClickAt([int]($r.X +$r.Width / 2), [int]($r.Y +$r.Height / 2))
-            $focused =$true
+$editCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit
+)
+$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)
+$focused = $false
+foreach ($el in $edits) {
+    $nm = $el.Current.Name
+    if ($nm -match "Type a message|Write a message|Message") {
+        $r = $el.Current.BoundingRectangle
+        if ($r.Width -gt 50 -and $r.Height -gt 12) {
+            [Win32Focus]::ClickAt([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+            $focused = $true
             break
-        }}
-    }}
-}}
+        }
+    }
+}
 
 Set-Clipboard -Value $msg
 Start-Sleep -Milliseconds 120
 [System.Windows.Forms.SendKeys]::SendWait('^v')
 Start-Sleep -Milliseconds 150
-[System.Windows.Forms.SendKeys]::SendWait('{{ENTER}}')
+[System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 Write-Output "SENT_MESSAGE [$appTitle]: Sent '$msg' (composeFocused=$focused)."
 """
+        ps_script = (
+            ps_template
+            .replace("__WIN32_CS__", WIN32_HELPER_CS)
+            .replace("__APP_TITLE__", json.dumps(app_name.strip()))
+            .replace("__MSG__", json.dumps(text))
+        )
         out = self._run_ps(ps_script, timeout=15.0)
         return prefix_log + (out or f"SENT_MESSAGE [{app_name}]: Sent '{text}'.")
 
@@ -286,138 +321,175 @@ Write-Output "SENT_MESSAGE [$appTitle]: Sent '$msg' (composeFocused=$focused)."
         if recipient.strip():
             prefix_log = self.in_app_search(app_name, recipient, open_first=True) + " | "
 
-        ps_script = f"""
+        ps_template = r"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
-{WIN32_HELPER_CS}
+__WIN32_CS__
 '@
 
-$appTitle = {json.dumps(app_name.strip())}$hint = {json.dumps(hint.strip())}
+$appTitle = __APP_TITLE__
+$hint = __HINT__
 
-$proc = Get-Process \vert{} Where-Object {{$_.MainWindowTitle -like "*$appTitle*" -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-if (-not $proc) {{ Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }}
-$hwnd =$proc.MainWindowHandle
+$hwnd = [IntPtr]::Zero
+foreach ($p in (Get-Process)) {
+    if ($p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like "*$appTitle*") {
+        $hwnd = $p.MainWindowHandle
+        break
+    }
+}
+if ($hwnd -eq [IntPtr]::Zero) { Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }
 [Win32Focus]::ForceForeground($hwnd)
 Start-Sleep -Milliseconds 350
 
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-$winRect =$root.Current.BoundingRectangle
+$winRect = $root.Current.BoundingRectangle
 
-# 1. Open Stickers or Emoji/Stickers tray in bottom compose bar
-$all =$root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-$openedTray =$false
-foreach ($el in$all) {{
-    $ct =$el.Current.ControlType.ProgrammaticName
-    $nm =$el.Current.Name
-    if ($ct -eq "ControlType.Button" -and $nm -and ($nm -match "Sticker|Emoji")) {{
-        $r =$el.Current.BoundingRectangle
-        if ($r.Width -gt 14 -and $r.Height -gt 14 -and$r.Y -gt ($winRect.Y +$winRect.Height * 0.65)) {{
-            [Win32Focus]::ClickAt([int]($r.X +$r.Width / 2), [int]($r.Y +$r.Height / 2))
-            $openedTray =$true
+$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$openedTray = $false
+foreach ($el in $all) {
+    $ct = $el.Current.ControlType.ProgrammaticName
+    $nm = $el.Current.Name
+    if ($ct -eq "ControlType.Button" -and $nm -and ($nm -match "Sticker|Emoji")) {
+        $r = $el.Current.BoundingRectangle
+        if ($r.Width -gt 14 -and $r.Height -gt 14 -and $r.Y -gt ($winRect.Y + $winRect.Height * 0.65)) {
+            [Win32Focus]::ClickAt([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+            $openedTray = $true
             break
-        }}
-    }}
-}}
+        }
+    }
+}
 
-if (-not $openedTray) {{
+if (-not $openedTray) {
     Write-Output "STICKER_TRAY_NOT_FOUND: Could not find Emoji/Stickers button in '$appTitle'. Make sure a chat is open."
     exit 0
-}}
+}
 
 Start-Sleep -Milliseconds 650
 
-# 2. Switch to Stickers tab inside the tray if visible
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-$trayElems =$root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-foreach ($el in$trayElems) {{
-    $ct =$el.Current.ControlType.ProgrammaticName
-    $nm =$el.Current.Name
-    if (($ct -eq "ControlType.Button" -or $ct -eq "ControlType.TabItem") -and $nm -and ($nm -match "^Stickers?$")) {{
-        $r =$el.Current.BoundingRectangle
-        if ($r.Width -gt 16 -and$r.Height -gt 16) {{
-            [Win32Focus]::ClickAt([int]($r.X +$r.Width / 2), [int]($r.Y +$r.Height / 2))
+$trayElems = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+foreach ($el in $trayElems) {
+    $ct = $el.Current.ControlType.ProgrammaticName
+    $nm = $el.Current.Name
+    if (($ct -eq "ControlType.Button" -or $ct -eq "ControlType.TabItem") -and $nm -and ($nm -match "^Stickers?$")) {
+        $r = $el.Current.BoundingRectangle
+        if ($r.Width -gt 16 -and $r.Height -gt 16) {
+            [Win32Focus]::ClickAt([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
             Start-Sleep -Milliseconds 650
             break
-        }}
-    }}
-}}
+        }
+    }
+}
 
-# 3. Click the matching (or first available) sticker in the sticker grid
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)$gridElems = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)$clickedSticker = ""
-foreach ($el in$gridElems) {{
-    $ct =$el.Current.ControlType.ProgrammaticName
-    $nm =$el.Current.Name
-    if (($ct -eq "ControlType.Button" -or $ct -eq "ControlType.ListItem" -or $ct -eq "ControlType.Image") -and $nm -and ($nm -match "Sticker")) {{
-        if ($nm -notmatch "^Stickers?$" -and $nm -notmatch "Emoji") {{
-            if ($hint -eq "" -or $nm -match [regex]::Escape($hint)) {{
-                $r =$el.Current.BoundingRectangle
-                if ($r.Width -ge 40 -and $r.Height -ge 40 -and$r.Y -lt ($winRect.Y +$winRect.Height - 55)) {{
-                    [Win32Focus]::ClickAt([int]($r.X +$r.Width / 2), [int]($r.Y +$r.Height / 2))
-                    $clickedSticker =$nm
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+$gridElems = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$clickedSticker = ""
+foreach ($el in $gridElems) {
+    $ct = $el.Current.ControlType.ProgrammaticName
+    $nm = $el.Current.Name
+    if (($ct -eq "ControlType.Button" -or $ct -eq "ControlType.ListItem" -or $ct -eq "ControlType.Image") -and $nm -and ($nm -match "Sticker")) {
+        if ($nm -notmatch "^Stickers?$" -and $nm -notmatch "Emoji") {
+            if ($hint -eq "" -or $nm -match [regex]::Escape($hint)) {
+                $r = $el.Current.BoundingRectangle
+                if ($r.Width -ge 40 -and $r.Height -ge 40 -and $r.Y -lt ($winRect.Y + $winRect.Height - 55)) {
+                    [Win32Focus]::ClickAt([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+                    $clickedSticker = $nm
                     break
-                }}
-            }}
-        }}
-    }}
-}}
+                }
+            }
+        }
+    }
+}
 
-if ($clickedSticker -ne "") {{
+if ($clickedSticker -ne "") {
     Write-Output "SENT_STICKER [$appTitle]: Clicked '$clickedSticker'."
-}} else {{
+} else {
     Write-Output "STICKER_PICKER_OPENED [$appTitle]: Opened Stickers tray, but no clickable sticker item matched automatically."
-}}
+}
 """
+        ps_script = (
+            ps_template
+            .replace("__WIN32_CS__", WIN32_HELPER_CS)
+            .replace("__APP_TITLE__", json.dumps(app_name.strip()))
+            .replace("__HINT__", json.dumps(hint.strip()))
+        )
         out = self._run_ps(ps_script, timeout=18.0)
         return prefix_log + (out or f"SENT_STICKER [{app_name}]: Triggered sticker send.")
 
     def inspect_ui(self, app_name: str, max_items: int = 45) -> str:
-        ps_script = f"""
+        ps_template = r"""
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
-$appTitle = {json.dumps(app_name.strip())}
-$proc = Get-Process \vert{} Where-Object {{$_.MainWindowTitle -like "*$appTitle*" -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-if (-not $proc) {{ Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }}
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($proc.MainWindowHandle)$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)$items = @()
-foreach ($el in$all) {{
-    $nm =$el.Current.Name
-    if ($nm) {{
-        $ct =$el.Current.ControlType.ProgrammaticName -replace "ControlType\\.", ""
+$appTitle = __APP_TITLE__
+$hwnd = [IntPtr]::Zero
+foreach ($p in (Get-Process)) {
+    if ($p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like "*$appTitle*") {
+        $hwnd = $p.MainWindowHandle
+        break
+    }
+}
+if ($hwnd -eq [IntPtr]::Zero) { Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$items = @()
+foreach ($el in $all) {
+    $nm = $el.Current.Name
+    if ($nm) {
+        $ct = $el.Current.ControlType.ProgrammaticName -replace "ControlType\.", ""
         $items += "$ct('$nm')"
-        if ($items.Count -ge {max_items}) {{ break }}
-    }}
-}}
+        if ($items.Count -ge __MAX_ITEMS__) { break }
+    }
+}
 Write-Output ($items -join ", ")
 """
+        ps_script = (
+            ps_template
+            .replace("__APP_TITLE__", json.dumps(app_name.strip()))
+            .replace("__MAX_ITEMS__", str(max_items))
+        )
         out = self._run_ps(ps_script, timeout=10.0)
         return f"UI_ELEMENTS [{app_name}]: {out}" if out else f"UI_ELEMENTS [{app_name}]: none found"
 
     def click_ui(self, app_name: str, control_name: str) -> str:
-        ps_script = f"""
+        ps_template = r"""
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
-{WIN32_HELPER_CS}
+__WIN32_CS__
 '@
-$appTitle = {json.dumps(app_name.strip())}$targetName = {json.dumps(control_name.strip())}
-$proc = Get-Process \vert{} Where-Object {{$_.MainWindowTitle -like "*$appTitle*" -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-if (-not $proc) {{ Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }}
-[Win32Focus]::ForceForeground($proc.MainWindowHandle)
+$appTitle = __APP_TITLE__
+$targetName = __TARGET_NAME__
+$hwnd = [IntPtr]::Zero
+foreach ($p in (Get-Process)) {
+    if ($p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like "*$appTitle*") {
+        $hwnd = $p.MainWindowHandle
+        break
+    }
+}
+if ($hwnd -eq [IntPtr]::Zero) { Write-Output "WINDOW_NOT_FOUND: '$appTitle'"; exit 0 }
+[Win32Focus]::ForceForeground($hwnd)
 Start-Sleep -Milliseconds 250
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($proc.MainWindowHandle)
-$all =$root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-foreach ($el in$all) {{
-    $nm =$el.Current.Name
-    if ($nm -and $nm -match [regex]::Escape($targetName)) {{
-        $r =$el.Current.BoundingRectangle
-        if ($r.Width -gt 4 -and$r.Height -gt 4) {{
-            [Win32Focus]::ClickAt([int]($r.X +$r.Width / 2), [int]($r.Y +$r.Height / 2))
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+foreach ($el in $all) {
+    $nm = $el.Current.Name
+    if ($nm -and $nm -match [regex]::Escape($targetName)) {
+        $r = $el.Current.BoundingRectangle
+        if ($r.Width -gt 4 -and $r.Height -gt 4) {
+            [Win32Focus]::ClickAt([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
             Write-Output "CLICKED_UI [$appTitle]: '$nm'"
             exit 0
-        }}
-    }}
-}}
+        }
+    }
+}
 Write-Output "CONTROL_NOT_FOUND [$appTitle]: '$targetName'"
 """
+        ps_script = (
+            ps_template
+            .replace("__WIN32_CS__", WIN32_HELPER_CS)
+            .replace("__APP_TITLE__", json.dumps(app_name.strip()))
+            .replace("__TARGET_NAME__", json.dumps(control_name.strip()))
+        )
         return self._run_ps(ps_script, timeout=10.0)
