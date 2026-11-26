@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 
 ToolName = Literal[
     "done",
+    "analyze_youtube",
     "see_screen",
     "click_screen_target",
     "launch_app",

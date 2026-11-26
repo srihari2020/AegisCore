@@ -97,9 +97,8 @@ class AegisAgent:
 
         synth_prompt = (
             "You are AegisCore, an intelligent, calm, sharp local AI assistant inspired by JARVIS.\n"
-            "The action has ALREADY been executed. Based strictly on the Verified Result below:\n"
-            "Write a 1-sentence confirmation of what was done/read/seen, followed by 'Next Ideas:' with 2 specific, practical follow-up actions.\n"
-            "Do not invent facts or omit the confirmation sentence.\n\n"
+            "Based strictly on the Verified Result below (never invent facts):\n"
+            "Give a direct, clear answer or confirmation of what was done/read/seen, followed by 'Next Ideas:' with 2 practical follow-up actions.\n\n"
             f"User Request: {user_input}\n"
             f"Verified Result: {verified_header}\n"
             f"Recalled Memories: {memories}"
@@ -108,14 +107,14 @@ class AegisAgent:
             model=self.model,
             messages=[{"role": "user", "content": synth_prompt}],
             keep_alive=-1,
-            options={"temperature": 0.25, "num_ctx": 4096, "num_predict": 240},
+            options={"temperature": 0.25, "num_ctx": 4096, "num_predict": 260},
         )
         body = resp.message.content.strip()
         if body.lower().startswith("next ideas"):
             return f"{verified_header}\n\n{body}"
         return f"[{verified_header}]\n{body}"
 
-    def run_turn(self, user_input: str, max_steps: int = 6) -> str:
+    def run_turn(self, user_input: str, max_steps: int = 5) -> str:
         apps = self.get_installed_apps()
         recalled_mem = self.mem.recall_memories(user_input)
         recalled_skills = self.mem.recall_skills(user_input)
@@ -130,10 +129,8 @@ class AegisAgent:
                 "You are AegisCore, a multimodal, zero-hallucination local JARVIS agent.\n"
                 "Respond ONLY with JSON matching AgentStepPlan: {tool, target, value, extra, message}.\n"
                 "TOOL GUIDE & EXAMPLES:\n"
-                '- Open/watch/play any YouTube video -> {"tool":"browser_tab","target":"carryminati latest video","value":"","extra":"youtube_play","message":""}\n'
-                '- Follow-up "play it" after a YouTube search -> {"tool":"browser_tab","target":"","value":"","extra":"play_last","message":""}\n'
-                '- Open website URL -> {"tool":"browser_tab","target":"https://www.youtube.com","value":"","extra":"open","message":""}\n'
-                '- Web search -> {"tool":"browser_tab","target":"latest linux kernel","value":"","extra":"search","message":""}\n'
+                '- Open/watch/play any YouTube video -> {"tool":"browser_tab","target":"triggerinsaan latest video","value":"","extra":"youtube_play","message":""}\n'
+                '- Question about active/last YouTube video (e.g. "what was it about") -> {"tool":"analyze_youtube","target":"","value":"summarize","extra":"","message":""}\n'
                 '- See screen / click on screen -> {"tool":"see_screen","target":"","value":"what is open on screen","extra":"","message":""}\n'
                 '- Click numbered box from see_screen -> {"tool":"click_screen_target","target":"","value":"12","extra":"","message":""}\n'
                 '- Launch app -> {"tool":"launch_app","target":"whatsapp","value":"","extra":"","message":""}\n'
@@ -145,8 +142,8 @@ class AegisAgent:
                 '- Write file/code/report -> {"tool":"write_content","target":"notes.md","value":"...","extra":"","message":""}\n'
                 '- Save memory / skill / ask_user / done.\n'
                 "STRICT RULES:\n"
-                "1. NEVER invent or guess file paths for read_document or watch_video. If the user says 'play it' without a file path, use browser_tab(extra='play_last') or see_screen.\n"
-                "2. For any request to open or play a YouTube video (e.g., 'open carryminati latest video'), ALWAYS use browser_tab with extra='youtube_play'.\n"
+                "1. When Browser State has a YouTube watch URL and user asks what the video is about, use tool='analyze_youtube'.\n"
+                "2. NEVER invent or guess file paths for read_document or watch_video.\n"
                 "3. NEVER return tool='done' claiming you will do an action without executing the tool first.\n"
                 "4. Once requested tools succeed in Observations, call tool='done' immediately.\n\n"
                 f"Installed Apps ({len(apps)}): {apps[:100]}\n"
@@ -231,7 +228,16 @@ class AegisAgent:
             executed_signatures.add(sig)
             observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
 
-            if not is_compound and plan.tool in {"browser_tab", "launch_app", "in_app_search", "send_message", "send_sticker", "write_content", "save_memory", "save_skill"}:
+            # Halt immediately on hard tool errors instead of retrying identical calls
+            if obs.startswith("TOOL_ERROR"):
+                final_out = self._jarvis_synthesize(user_input, observations, recalled_mem)
+                self.recent_turns.append(f"User: {user_input} -> AegisCore: {final_out[:240]}")
+                return final_out
+
+            if not is_compound and plan.tool in {
+                "analyze_youtube", "browser_tab", "launch_app", "in_app_search",
+                "send_message", "send_sticker", "write_content", "save_memory", "save_skill"
+            }:
                 final_out = self._jarvis_synthesize(user_input, observations, recalled_mem)
                 self.recent_turns.append(f"User: {user_input} -> AegisCore: {final_out[:240]}")
                 return final_out
@@ -241,7 +247,9 @@ class AegisAgent:
         return final_out
 
     def _execute_tool(self, plan: AgentStepPlan, user_input: str) -> str:
-        if plan.tool == "see_screen":
+        if plan.tool == "analyze_youtube":
+            return self.browser.analyze_youtube(plan.target)
+        elif plan.tool == "see_screen":
             decision = self.vision.see_and_reason(plan.value or user_input)
             click_note = ""
             if decision.target_element_id > 0 and decision.confidence >= 0.70 and any(

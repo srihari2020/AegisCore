@@ -1,5 +1,8 @@
+import html
+import json
 import re
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote_plus
 import httpx
@@ -17,6 +20,14 @@ SITE_SHORTCUTS = {
     "chatgpt": "https://chatgpt.com",
     "leetcode": "https://leetcode.com",
     "arxiv": "https://arxiv.org",
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 class BrowserHands:
@@ -57,19 +68,11 @@ class BrowserHands:
         return f"https://www.google.com/search?q={quote_plus(clean)}"
 
     def _resolve_youtube_top_video(self, query: str) -> str | None:
-        """Resolves the top playable YouTube watch?v= URL for a search query."""
         try:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            }
             resp = httpx.get(
                 "https://www.youtube.com/results",
                 params={"search_query": query},
-                headers=headers,
+                headers=HEADERS,
                 timeout=6.0,
             )
             ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
@@ -79,6 +82,52 @@ class BrowserHands:
         except Exception:
             pass
         return None
+
+    def analyze_youtube(self, url: str = "") -> str:
+        target_url = url.strip() or self.last_url
+        if "youtube.com/watch" not in target_url and "youtu.be/" not in target_url:
+            return "NO_ACTIVE_YOUTUBE_VIDEO: No YouTube video URL is currently active."
+
+        try:
+            resp = httpx.get(target_url, headers=HEADERS, follow_redirects=True, timeout=8.0)
+            page_html = resp.text
+
+            title_m = re.search(r'"title":"(.*?)"', page_html)
+            author_m = re.search(r'"author":"(.*?)"', page_html)
+            desc_m = re.search(r'"shortDescription":"(.*?)"', page_html)
+
+            def unescape_json_str(val: str) -> str:
+                try:
+                    return json.loads(f'"{val}"')
+                except Exception:
+                    return html.unescape(val)
+
+            title = unescape_json_str(title_m.group(1)) if title_m else "Unknown Title"
+            author = unescape_json_str(author_m.group(1)) if author_m else "Unknown Channel"
+            desc = unescape_json_str(desc_m.group(1))[:1200] if desc_m else ""
+
+            transcript_text = ""
+            cap_m = re.search(r'"captionTracks":(\[.*?\])', page_html)
+            if cap_m:
+                try:
+                    tracks = json.loads(cap_m.group(1))
+                    if tracks and "baseUrl" in tracks[0]:
+                        cap_xml = httpx.get(tracks[0]["baseUrl"], headers=HEADERS, timeout=6.0).text
+                        root = ET.fromstring(cap_xml)
+                        lines = [html.unescape(el.text or "").strip() for el in root.findall(".//text")]
+                        transcript_text = " ".join(l for l in lines if l)[:3500]
+                except Exception:
+                    pass
+
+            return (
+                f"YOUTUBE_VIDEO_INFO ({target_url}):\n"
+                f"- Title: {title}\n"
+                f"- Channel: {author}\n"
+                f"- Description: {desc or 'No description'}\n"
+                f"- Captions/Transcript: {transcript_text or 'No captions available for this video'}"
+            )
+        except Exception as e:
+            return f"YOUTUBE_ANALYZE_ERROR: {e}"
 
     def tab_action(self, action: str, url_or_query: str) -> str:
         clean = url_or_query.strip()

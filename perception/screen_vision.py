@@ -49,11 +49,26 @@ class VisualActionDecision(BaseModel):
 class ScreenVisionEngine:
     def __init__(self, vision_model: str = "qwen2.5vl:3b"):
         self.vision_model = self._resolve_vision_model(vision_model)
-        self.win_temp_dir = Path("/mnt/c/Users/Public/AegisCore_Cache")
-        self.win_temp_dir.mkdir(parents=True, exist_ok=True)
-        self.raw_png = self.win_temp_dir / "raw_screen.png"
-        self.som_png = self.win_temp_dir / "som_screen.png"
+        self.win_cache_str, self.wsl_cache_dir = self._init_windows_cache()
+        self.raw_png = self.wsl_cache_dir / "raw_screen.png"
+        self.som_png = self.wsl_cache_dir / "som_screen.png"
         self.last_elements: dict[int, dict] = {}
+
+    def _init_windows_cache(self) -> tuple[str, Path]:
+        try:
+            win_temp = subprocess.check_output(
+                ["cmd.exe", "/c", "echo", "%TEMP%"],
+                cwd="/mnt/c",
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="ignore").strip()
+            wsl_temp = subprocess.check_output(["wslpath", "-u", win_temp]).decode().strip()
+            cache_dir = Path(wsl_temp) / "AegisCore_Cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return f"{win_temp}\\AegisCore_Cache", cache_dir
+        except Exception:
+            fallback = Path("/tmp/AegisCore_Cache")
+            fallback.mkdir(parents=True, exist_ok=True)
+            return r"C:\Windows\Temp\AegisCore_Cache", fallback
 
     def _resolve_vision_model(self, preferred: str) -> str:
         try:
@@ -65,7 +80,7 @@ class ScreenVisionEngine:
             pass
         return preferred
 
-    def _run_ps(self, script: str, timeout: float = 15.0) -> str:
+    def _run_ps(self, script: str, timeout: float = 15.0) -> tuple[str, str]:
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         res = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
@@ -74,19 +89,24 @@ class ScreenVisionEngine:
             text=True,
             timeout=timeout,
         )
-        return res.stdout.strip()
+        return res.stdout.strip(), res.stderr.strip()
 
     def capture_and_annotate(self) -> tuple[Path, dict[int, dict], str]:
-        """Captures DPI-aware Windows screen + UIA bounding boxes and draws numbered Set-of-Mark tags."""
-        win_png_path = r"C:\Users\Public\AegisCore_Cache\raw_screen.png"
+        if self.raw_png.exists():
+            self.raw_png.unlink()
+
+        win_png_path = f"{self.win_cache_str}\\raw_screen.png"
         ps_template = r"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
-Add-Type -TypeDefinition @'
+
+$csCode = @'
 __CAPTURE_CS__
 '@
+$refs = @([System.Drawing.Bitmap].Assembly.Location, [System.Windows.Forms.Form].Assembly.Location)
+Add-Type -TypeDefinition $csCode -ReferencedAssemblies $refs
 
 [ScreenGrabber]::CaptureFullScreen('__OUT_PNG__')
 $hwnd = [ScreenGrabber]::GetForegroundWindow()
@@ -132,7 +152,10 @@ Write-Output ($outObj | ConvertTo-Json -Depth 4 -Compress)
             .replace("__CAPTURE_CS__", CAPTURE_CS)
             .replace("__OUT_PNG__", win_png_path)
         )
-        raw_json = self._run_ps(ps_script, timeout=15.0)
+        raw_json, stderr = self._run_ps(ps_script, timeout=15.0)
+        if not self.raw_png.exists():
+            raise RuntimeError(f"Windows screen capture failed: {stderr or 'raw_screen.png not created'}")
+
         data = json.loads(raw_json) if raw_json else {"window": "Unknown", "elements": []}
         win_title = data.get("window", "Unknown")
         elems_list = data.get("elements") or []
@@ -142,7 +165,6 @@ Write-Output ($outObj | ConvertTo-Json -Depth 4 -Compress)
         elem_map = {int(e["id"]): e for e in elems_list}
         self.last_elements = elem_map
 
-        # Draw high-contrast Set-of-Mark numbered boxes onto screenshot
         img = Image.open(self.raw_png).convert("RGB")
         draw = ImageDraw.Draw(img)
         font = ImageFont.load_default()
@@ -156,7 +178,6 @@ Write-Output ($outObj | ConvertTo-Json -Depth 4 -Compress)
             draw.rectangle([x1, max(0, y1 - 14), x1 + tw, max(14, y1)], fill=(255, 50, 50))
             draw.text((x1 + 3, max(1, y1 - 13)), tag, fill=(255, 255, 255), font=font)
 
-        # Resize copy for fast VLM inference while preserving original coordinates in elem_map
         img.thumbnail((1440, 900))
         img.save(self.som_png, format="PNG", optimize=True)
         return self.som_png, elem_map, win_title
@@ -196,9 +217,13 @@ Write-Output ($outObj | ConvertTo-Json -Depth 4 -Compress)
             return f"INVALID_ELEMENT_ID: [{element_id}] not in current screen map."
         cx, cy = int(el["cx"]), int(el["cy"])
         ps_template = r"""
-Add-Type -TypeDefinition @'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$csCode = @'
 __CAPTURE_CS__
 '@
+$refs = @([System.Drawing.Bitmap].Assembly.Location, [System.Windows.Forms.Form].Assembly.Location)
+Add-Type -TypeDefinition $csCode -ReferencedAssemblies $refs
 [ScreenGrabber]::ClickAt(__CX__, __CY__)
 """
         ps_script = (
