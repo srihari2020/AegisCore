@@ -17,7 +17,7 @@ ACTION_VERBS = (
     "open ", "launch ", "start ", "send ", "message ", "reply ", "type ",
     "click ", "press ", "search ", "find ", "download ", "save ", "remember ",
     "close ", "move ", "delete ", "inspect ", "run ", "see ", "look ", "read ",
-    "watch ", "summarize ", "write ", "draft ", "create ", "mcp ",
+    "watch ", "play ", "summarize ", "write ", "draft ", "create ", "mcp ",
 )
 
 def get_win_bridge_url() -> str:
@@ -92,23 +92,28 @@ class AegisAgent:
         return any(low.startswith(v) or f" {v}" in f" {low}" for v in ACTION_VERBS)
 
     def _jarvis_synthesize(self, user_input: str, observations: list[str], memories: list[str]) -> str:
-        """Synthesizes execution results, documents, or screen observations in Jarvis voice + proactive ideas."""
+        clean_obs = [o.split("]: ", 1)[-1] for o in observations]
+        verified_header = "\n".join(clean_obs)
+
         synth_prompt = (
             "You are AegisCore, an intelligent, calm, sharp local AI assistant inspired by JARVIS.\n"
-            "Based strictly on the verified Tool Observations below (zero invented facts):\n"
-            "1. Give a crisp, direct answer or confirmation of what was done/read/seen.\n"
-            "2. Add a brief 'Next Ideas:' section with 2 practical, high-value follow-up actions you can execute right now.\n\n"
+            "The action has ALREADY been executed. Based strictly on the Verified Result below:\n"
+            "Write a 1-sentence confirmation of what was done/read/seen, followed by 'Next Ideas:' with 2 specific, practical follow-up actions.\n"
+            "Do not invent facts or omit the confirmation sentence.\n\n"
             f"User Request: {user_input}\n"
-            f"Recalled Memories: {memories}\n"
-            f"Verified Observations:\n" + "\n".join(observations)
+            f"Verified Result: {verified_header}\n"
+            f"Recalled Memories: {memories}"
         )
         resp = chat(
             model=self.model,
             messages=[{"role": "user", "content": synth_prompt}],
             keep_alive=-1,
-            options={"temperature": 0.3, "num_ctx": 4096, "num_predict": 320},
+            options={"temperature": 0.25, "num_ctx": 4096, "num_predict": 240},
         )
-        return resp.message.content.strip()
+        body = resp.message.content.strip()
+        if body.lower().startswith("next ideas"):
+            return f"{verified_header}\n\n{body}"
+        return f"[{verified_header}]\n{body}"
 
     def run_turn(self, user_input: str, max_steps: int = 6) -> str:
         apps = self.get_installed_apps()
@@ -118,27 +123,30 @@ class AegisAgent:
         observations: list[str] = []
         executed_signatures: set[tuple[str, str, str, str]] = set()
         promise_retries = 0
+        is_compound = any(sep in user_input.lower() for sep in (" and then ", " then ", ";"))
 
         for step_idx in range(max_steps):
             sys_prompt = (
                 "You are AegisCore, a multimodal, zero-hallucination local JARVIS agent.\n"
                 "Respond ONLY with JSON matching AgentStepPlan: {tool, target, value, extra, message}.\n"
-                "TOOL GUIDE:\n"
-                "- see_screen: Capture Windows screen + numbered UI boxes and analyze what is visible (value=goal/question).\n"
-                "- click_screen_target: Click an exact [ID] box discovered by see_screen (value=integer ID).\n"
-                "- launch_app: Open any Windows/Store app (target=app_name).\n"
-                "- in_app_search: Focus app, Ctrl+F, and open matching chat/item (target=app, value=query, extra='open_first').\n"
-                "- send_message / send_sticker: Send text or sticker in app (target='whatsapp', value=text, extra=recipient).\n"
-                "- browser_tab: Open/search/close web tab (target=url_or_query, extra='open'|'search'|'close').\n"
-                "- download_item: Download file to folder (target=url, value=save_dir, extra='auto').\n"
-                "- read_document: Read PDF, DOCX, Markdown, or code file (target=file_path).\n"
-                "- watch_video: Transcribe audio + analyze keyframes of a video (target=video_path, value=question).\n"
-                "- mcp_call: Invoke an MCP server tool (target=server_name, value=tool_name, extra=json_args_string).\n"
-                "- write_content: Write a document, script, report, or email to workspace (target=filename, value=content).\n"
-                "- save_memory / save_skill / ask_user / done.\n"
+                "TOOL GUIDE & EXAMPLES:\n"
+                '- Watch/play YouTube video -> {"tool":"browser_tab","target":"cybersecurity","value":"","extra":"youtube_play","message":""}\n'
+                '- Search YouTube -> {"tool":"browser_tab","target":"rust tutorial","value":"","extra":"youtube_search","message":""}\n'
+                '- Open website -> {"tool":"browser_tab","target":"https://www.youtube.com","value":"","extra":"open","message":""}\n'
+                '- Web search -> {"tool":"browser_tab","target":"latest linux kernel","value":"","extra":"search","message":""}\n'
+                '- See screen / click on screen -> {"tool":"see_screen","target":"","value":"what is open on screen","extra":"","message":""}\n'
+                '- Click numbered box from see_screen -> {"tool":"click_screen_target","target":"","value":"12","extra":"","message":""}\n'
+                '- Launch app -> {"tool":"launch_app","target":"whatsapp","value":"","extra":"","message":""}\n'
+                '- Open chat in app -> {"tool":"in_app_search","target":"whatsapp","value":"gopi","extra":"open_first","message":""}\n'
+                '- Send message / sticker -> {"tool":"send_message","target":"whatsapp","value":"hello","extra":"gopi","message":""} or tool="send_sticker"\n'
+                '- Read PDF/DOCX/code -> {"tool":"read_document","target":"C:\\path\\file.pdf","value":"","extra":"","message":""}\n'
+                '- Watch/analyze video file -> {"tool":"watch_video","target":"C:\\path\\video.mp4","value":"summarize","extra":"","message":""}\n'
+                '- Call MCP server tool -> {"tool":"mcp_call","target":"server_name","value":"tool_name","extra":"{\\"arg\\":\\"val\\"}","message":""}\n'
+                '- Write file/code/report -> {"tool":"write_content","target":"notes.md","value":"...","extra":"","message":""}\n'
+                '- Save memory / skill / ask_user / done.\n'
                 "STRICT RULES:\n"
-                "1. NEVER return tool='done' claiming you will do an action without executing the tool first.\n"
-                "2. Never invent app names, file paths, or UI IDs not in Context or Observations.\n"
+                "1. NEVER pass a bare topic word like 'cybersecurity' as a URL to browser_tab(extra='open'); use extra='youtube_play', 'youtube_search', or 'search'.\n"
+                "2. NEVER return tool='done' claiming you will do an action without executing the tool first.\n"
                 "3. Once requested tools succeed in Observations, call tool='done' immediately.\n\n"
                 f"Installed Apps ({len(apps)}): {apps[:100]}\n"
                 f"MCP Tools Available: {mcp_tools[:30]}\n"
@@ -220,6 +228,11 @@ class AegisAgent:
 
             executed_signatures.add(sig)
             observations.append(f"Step {step_idx + 1} [{plan.tool}]: {obs}")
+
+            if not is_compound and plan.tool in {"browser_tab", "launch_app", "in_app_search", "send_message", "send_sticker", "write_content", "save_memory", "save_skill"}:
+                final_out = self._jarvis_synthesize(user_input, observations, recalled_mem)
+                self.recent_turns.append(f"User: {user_input} -> AegisCore: {final_out[:240]}")
+                return final_out
 
         final_out = self._jarvis_synthesize(user_input, observations, recalled_mem)
         self.recent_turns.append(f"User: {user_input} -> AegisCore: {final_out[:240]}")
